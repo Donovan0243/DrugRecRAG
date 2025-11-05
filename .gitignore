@@ -1,0 +1,106 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+env.bak/
+venv.bak/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# 日志文件
+*.log
+*.log.*
+
+# 数据文件（大型文件）
+# 向量索引文件（FAISS）
+data/embeddings/*.index
+data/embeddings/*_mapping.json
+# 注意：保留README.md，但忽略实际的索引文件
+
+# 数据库文件
+*.dump
+*.db
+*.sqlite
+*.sqlite3
+
+# Pickle文件（可能包含大型对象）
+*.pkl
+*.pickle
+
+# 评测结果输出
+runs/
+src-1/runs/
+src-1/runs_one_kg/
+*.jsonl
+
+# 环境变量和配置（包含敏感信息）
+.env
+.env.local
+.env.*.local
+*.key
+*.pem
+secrets/
+
+# 临时文件
+*.tmp
+*.temp
+*.bak
+*.backup
+*.orig
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# 测试覆盖率
+.coverage
+htmlcov/
+.pytest_cache/
+.tox/
+.hypothesis/
+
+# 大型数据目录
+CmeKG/
+kg/
+
+# 论文PDF
+*.pdf
+
+# 临时笔记文件
+src-1/
+data/
+dialmed/
+appendix/
+docs/
+kg_schema.json
