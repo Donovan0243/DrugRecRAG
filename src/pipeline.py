@@ -203,6 +203,8 @@ def run_gap(dialogue_text: str, kg_triples: List[tuple] = None) -> Dict:
                 "kg_id": meta.get("kg_id"),
                 "kg_source": meta.get("kg_source"),
                 "main_state": meta.get("main-state"),
+                # 新增：输出槽位里的既往史字段，便于调试观察
+                "past_medical_history": meta.get("past-medical-history"),
             })
 
     # 6) 先问LLM要查什么类型（使用原始graph，不包含KG事实）
@@ -232,7 +234,7 @@ def run_gap(dialogue_text: str, kg_triples: List[tuple] = None) -> Dict:
     # NP：负责"发现"候选药物（动态触发，1-hop查询）
     np_facts = retrieval.build_np(kg_triples or triples, kg, linked_states=linked_states, relation_type=relation_type, trace=trace)
     # PP：负责"验证"候选药物的安全性（Schema匹配 + 多源验证）
-    pp_items = retrieval.build_pp(kg_triples or triples, kg, linked_states=linked_states, np_facts=np_facts, trace=trace)
+    pp_items = retrieval.build_pp(kg_triples or triples, kg, linked_states=linked_states, np_facts=np_facts, trace=trace, dialogue_text=dialogue_text)
 
     # 7.5) 从 graph_text（纯Gp）、NP/PP、linked_states 中提取候选疾病和药物
     candidate_diseases, candidate_medications = _extract_candidates(

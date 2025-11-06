@@ -59,6 +59,29 @@ def relation_type_classifier(context: str, graph_text: str) -> str:
     )
 
 
+def schema_selector(dialogue_text: str) -> str:
+    # 中文：仅基于对话全文，按明确中文规则选择需要触发的 PP Schema，返回 JSON 数组（名称原样）
+    return (
+        "你是一名临床推理助理。仅基于以下“中文医疗对话”，选择本轮需要触发的 PP 验证 Schema。\n"
+        "只返回 JSON 数组（不得包含多余文字），数组元素必须从下列名称中选择：\n"
+        "- pregnancy_symptom_medication\n"
+        "- specific_population_symptom_medication\n"
+        "- symptom_comorbidity_medication\n"
+        "- past_medical_history_symptom_medication\n"
+        "- drug_recommendation_symptom_medication\n"
+        "- taking_drug_symptom_medication\n\n"
+        "判定与触发规则（务必执行；满足则加入；可多选）：\n"
+        "1) 若出现“孕/怀孕/妊娠/孕妇/哺乳/哺乳期” → 加入 pregnancy_symptom_medication\n"
+        "2) 若出现“婴/宝宝/新生儿/儿童/小孩/幼儿/≤12个月龄/老年/高龄/老人” → 加入 specific_population_symptom_medication\n"
+        "3) 若症状提及达到2种或以上（如“头痛+反酸”） → 加入 symptom_comorbidity_medication\n"
+        "4) 若出现“以前/曾经/既往/病史/既往史”等既往病史措辞，且同时有当前症状 → 加入 past_medical_history_symptom_medication\n"
+        "5) 若出现“过敏/禁用/不推荐/不可用/医生负向态度”等用药限制或倾向 → 加入 drug_recommendation_symptom_medication\n"
+        "6) 若出现“正在服用/已在用”等正在用药表述 → 加入 taking_drug_symptom_medication\n\n"
+        "兜底：若不确定，仍至少选择与“人口/过敏/既往史/多症状”最相关的1-2个；禁止返回空数组。\n\n"
+        f"对话全文：\n{dialogue_text}\n\n"
+        "请严格只输出 JSON 数组，如：[\"schema_name\", ...]"
+    )
+
 def table8_final(
     context: str,
     graph_text: str,

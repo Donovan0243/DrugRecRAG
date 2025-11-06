@@ -21,7 +21,7 @@ class LLMConfig:
     provider: str = os.environ.get("LLM_PROVIDER", "gemini")  # options: ollama, gemini, dummy
     model: str = os.environ.get("LLM_MODEL_ID", "gemini-2.5-flash")  # options: qwen2.5:32b, gemini-2.5-flash, dummy
     base_url: str = os.environ.get("LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta")
-    api_key: str = os.environ.get("LLM_API_KEY", "xxxxx")
+    api_key: str = os.environ.get("LLM_API_KEY", "XXXXXXX")
 
     # 温度和最大令牌数
     temperature: float = float(os.environ.get("LLM_TEMPERATURE", "0.2"))
