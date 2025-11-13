@@ -1,706 +1,592 @@
-"""Neighborhood Prompts (NP) and Path-based Prompts (PP).
+"""新版检索模块：Phase A（候选生成）和 Phase B（安全验证）。
 
-中文说明：基于患者图与外部 KG 生成 NP/PP（最小可用实现）。
+中文说明：基于结构化患者状态JSON，执行候选生成和安全验证。
 """
 
-from typing import List, Tuple, Dict
-from .config import retrieval
-from .config import llm as llm_cfg
-import time
+from typing import Dict, List, Tuple
 from .kg import MultiKG, DiseaseKBKG, CMeKGKG
-from .prompts import relation_type_classifier, table6_reasoning, schema_selector
-from .inference import get_llm_caller
-from .schema import match_schemas, extract_drugs_from_np, extract_patient_status
+from .query import _get_vector_searcher  # 使用离线 FAISS 索引（data/embeddings）
+import numpy as np
+try:
+    from .embedding.encoder import EmbeddingEncoder  # 复用已有编码器（与离线索引同模）
+except Exception:
+    EmbeddingEncoder = None  # 运行期无可用编码器则降级
 
 
-def _filter_kg_facts_by_keywords(facts: List[str], keywords: List[str]) -> List[str]:
-    """根据关键词过滤KG事实。
+def phase_a_candidate_generation(patient_state: Dict, kg) -> List[str]:
+    """Phase A: 基于problems生成候选药物列表（NP-like）。
     
-    中文说明：从KG事实列表中，筛选出包含指定关键词的事实。
-    这是GAP"定向审查"（Targeted Review）的核心实现：只返回与关键风险点相关的信息。
+    改进版（推理逻辑）：优先使用疾病查询，避免噪音。
+    - 如果疾病查询有结果 → 直接返回，不再查询症状（避免噪音）
+    - 如果疾病查询为空 → 才查询症状（作为fallback）
+    
+    这样做的目的是：
+    1. 提高准确率：避免"感冒+头痛"查询返回"高血压"药物
+    2. 提高召回率：症状查询支持1跳和2跳路径
     
     Args:
-        facts: KG事实列表（文本格式）
-        keywords: 关键词列表（用于过滤）
+        patient_state: 结构化患者状态JSON
+        kg: 知识图谱实例
     
     Returns:
-        过滤后的KG事实列表
-    """
-    if not facts or not keywords:
-        return facts
-    
-    filtered = []
-    facts_lower = [f.lower() for f in facts]
-    keywords_lower = [k.lower() for k in keywords]
-    
-    for fact, fact_lower in zip(facts, facts_lower):
-        # 检查是否包含任何关键词
-        if any(kw in fact_lower for kw in keywords_lower):
-            filtered.append(fact)
-    
-    return filtered
-
-
-def _split_concepts_by_labels(linked_states: Dict[str, Dict]):
-    """从linked_states中提取疾病/症状/药物，即使链接失败也尝试使用原始名称。
-    
-    改进版：对于链接失败但状态为doctor-positive的实体，也应该尝试用于查询。
-    这是为了解决实体链接失败导致查不到相关药物的问题。
-    """
-    diseases, symptoms, drugs = set(), set(), set()
-    
-    for ent, meta in (linked_states or {}).items():
-        label = (meta.get("kg_label") or "").lower()
-        main_state = (meta.get("main-state") or "").lower()
-        original_name = ent  # 原始实体名
-        kg_name = meta.get("kg_name", original_name)  # KG标准名称（如果有）
-        
-        if label == "disease":
-            # 已链接成功的疾病
-            diseases.add(kg_name)
-        elif label == "symptom":
-            symptoms.add(kg_name)
-        elif label == "drug":
-            drugs.add(kg_name)
-        else:
-            # 链接失败的情况：使用启发式判断 + 状态信息
-            # 优先处理 doctor-positive 状态的实体（医生明确诊断）
-            name_lower = original_name.lower()
-            
-            # 启发式：根据名称关键词判断类型
-            if any(k in name_lower for k in ["炎", "感冒", "综合征", "感染", "病", "症", "综合症"]):
-                # 判断为疾病：优先使用原始名称（即使链接失败）
-                # 特别是 doctor-positive 状态的疾病，必须尝试查询
-                if main_state == "doctor-positive":
-                    diseases.add(original_name)  # 优先使用原始名称
-                else:
-                    diseases.add(original_name)  # 也尝试使用原始名称
-            elif any(k in name_lower for k in ["痛", "痒", "咳", "热", "便", "恶心", "鼻塞", "腹泻", "拉肚子"]):
-                symptoms.add(original_name)
-            # 其他可能是药物，但不确定，暂时不加入drugs集合
-    
-    return list(diseases), list(symptoms), list(drugs)
-
-
-def build_np(triples: List[Tuple[str, str, str]], kg, linked_states: Dict[str, Dict] = None, relation_type: str = None, trace: List[Dict] = None) -> List[str]:
-    """Generate Neighborhood Prompts with relation-type classification.
-
-    中文：如果relation_type已提供，直接使用；否则先用 LLM 判定需要的知识类型，再调用对应的 Neo4j 查询。
-    """
-    # 如果relation_type已提供，直接使用；否则问LLM
-    if relation_type is None:
-        caller = get_llm_caller(expect_json=False)
-        context_text = "\n".join({s for s, p, o in triples if p == "has_concept"})
-        graph_text = "\n".join([f"({s},{p},{o})" for s, p, o in triples])
-        cls_prompt = relation_type_classifier(context_text, graph_text)
-        t0 = time.time()
-        label = caller(cls_prompt).strip().lower()
-        # 去掉可能的首尾引号，避免 "check" 这类无法匹配
-        if (label.startswith('"') and label.endswith('"')) or (label.startswith("'") and label.endswith("'")):
-            label = label[1:-1].strip()
-        dt = int((time.time() - t0) * 1000)
-        try:
-            print(f"[LLM][relation_type][{llm_cfg.provider}:{llm_cfg.model}] {dt} ms, in={len(cls_prompt)} chars, out={len(label)} chars")
-        except Exception:
-            pass
-        if trace is not None:
-            trace.append({"stage": "relation_type", "prompt": cls_prompt, "output": label})
-        relation_type = label
-
-    diseases, symptoms, _ = _split_concepts_by_labels(linked_states or {})
-
-    if isinstance(kg, (DiseaseKBKG, CMeKGKG, MultiKG)):
-        if relation_type == "treatment":
-            # 优先疾病→药物；改为每个疾病分别查询，确保每个疾病都有机会返回药物
-            all_facts = []
-            seen = set()  # 去重
-            
-            # 对每个疾病分别查询，避免全局LIMIT导致某些疾病被截断
-            for disease in diseases:
-                disease_facts = kg.drugs_for_diseases([disease], retrieval.topk_np)
-                for fact in disease_facts:
-                    if fact not in seen:
-                        seen.add(fact)
-                        all_facts.append(fact)
-                        # 如果已经收集了足够的facts，可以提前停止
-                        if len(all_facts) >= retrieval.topk_np * len(diseases):
-                            break
-                if len(all_facts) >= retrieval.topk_np * len(diseases):
-                    break
-            
-            # 如果疾病查询结果不足，再尝试症状链路
-            if not all_facts:
-                for symptom in symptoms:
-                    symptom_facts = kg.drugs_for_symptoms([symptom], retrieval.topk_np)
-                    for fact in symptom_facts:
-                        if fact not in seen:
-                            seen.add(fact)
-                            all_facts.append(fact)
-                            if len(all_facts) >= retrieval.topk_np * len(symptoms):
-                                break
-                    if len(all_facts) >= retrieval.topk_np * len(symptoms):
-                        break
-            
-            # 最后限制总数（但保留每个疾病的结果）
-            facts = all_facts[:retrieval.topk_np * max(1, len(diseases))] if diseases else all_facts[:retrieval.topk_np]
-            
-            if trace is not None:
-                trace.append({"stage": "np", "type": "treatment", "facts": facts})
-            return facts
-        if relation_type == "check":
-            # 检查关系：每个疾病分别查询
-            all_facts = []
-            seen = set()
-            for disease in diseases:
-                disease_facts = kg.checks_for_diseases([disease], retrieval.topk_np)
-                for fact in disease_facts:
-                    if fact not in seen:
-                        seen.add(fact)
-                        all_facts.append(fact)
-            facts = all_facts[:retrieval.topk_np * max(1, len(diseases))]
-            if trace is not None:
-                trace.append({"stage": "np", "type": "check", "facts": facts})
-            return facts
-        if relation_type == "diet":
-            # 饮食关系：每个疾病分别查询
-            all_facts = []
-            seen = set()
-            for disease in diseases:
-                disease_facts = kg.diet_for_diseases([disease], retrieval.topk_np)
-                for fact in disease_facts:
-                    if fact not in seen:
-                        seen.add(fact)
-                        all_facts.append(fact)
-            facts = all_facts[:retrieval.topk_np * max(1, len(diseases))]
-            if trace is not None:
-                trace.append({"stage": "np", "type": "diet", "facts": facts})
-            return facts
-        if relation_type == "symptom2disease":
-            # 症状→疾病→药物：每个症状分别查询
-            # 注意：对于symptom2disease，即使某些实体被链接成了Disease，如果名称包含症状关键词（如"痛"、"疼"），也应该作为症状查询
-            all_facts = []
-            seen = set()
-            
-            # 扩展症状列表：包括那些虽然被链接成Disease，但名称包含症状关键词的实体
-            extended_symptoms = list(symptoms)
-            for ent, meta in (linked_states or {}).items():
-                label = (meta.get("kg_label") or "").lower()
-                kg_name = meta.get("kg_name", ent)
-                original_name = ent.lower()
-                
-                # 如果被链接成了Disease，但名称包含症状关键词（如"痛"、"疼"），也作为症状查询
-                if label == "disease":
-                    symptom_keywords = ["痛", "疼", "痒", "咳", "热", "便", "恶心", "鼻塞", "腹泻", "拉肚子"]
-                    if any(kw in original_name or kw in kg_name.lower() for kw in symptom_keywords):
-                        if kg_name not in extended_symptoms:
-                            extended_symptoms.append(kg_name)
-            
-            # 如果仍然没有症状，尝试使用原始实体名称
-            if not extended_symptoms:
-                for ent, meta in (linked_states or {}).items():
-                    original_name = ent.lower()
-                    symptom_keywords = ["痛", "疼", "痒", "咳", "热", "便", "恶心", "鼻塞", "腹泻", "拉肚子"]
-                    if any(kw in original_name for kw in symptom_keywords):
-                        if ent not in extended_symptoms:
-                            extended_symptoms.append(ent)
-            
-            # 对每个症状分别查询
-            for symptom in extended_symptoms:
-                symptom_facts = kg.drugs_for_symptoms([symptom], retrieval.topk_np)
-                for fact in symptom_facts:
-                    if fact not in seen:
-                        seen.add(fact)
-                        all_facts.append(fact)
-            
-            # 改进：如果symptom2disease查询失败（没有结果），回退到treatment查询
-            fallback_used = False
-            if not all_facts:
-                # 尝试使用疾病名称查询（如果症状被链接成了疾病）
-                diseases, symptoms_split, _ = _split_concepts_by_labels(linked_states)
-                if diseases:
-                    # 回退到treatment查询
-                    fallback_used = True
-                    for disease in diseases:
-                        disease_facts = kg.drugs_for_diseases([disease], retrieval.topk_np)
-                        for fact in disease_facts:
-                            if fact not in seen:
-                                seen.add(fact)
-                                all_facts.append(fact)
-            
-            facts = all_facts[:retrieval.topk_np * max(1, len(extended_symptoms))]
-            if trace is not None:
-                trace.append({"stage": "np", "type": "symptom2disease", "symptoms": extended_symptoms, "facts": facts, "fallback_to_treatment": fallback_used})
-            return facts
-
-    # 不支持的KG类型（理论上不会发生）
-    return []
-
-
-def _filter_kg_results(kg_results: List[str], candidate_drugs: List[str]) -> List[str]:
-    """过滤KG验证结果，只保留候选药物的信息。
-    
-    中文：确保KG验证只返回候选药物的信息，不包含其他药物。
-    """
-    filtered = []
-    for result in kg_results:
-        # 检查结果中是否包含候选药物
-        if any(drug in result for drug in candidate_drugs):
-            filtered.append(result)
-    return filtered
-
-
-# 注意：已移除硬编码过滤函数
-# 原因：硬编码过滤不现实，症状和关键词组合太多，无法穷尽
-# 方案：返回所有KG信息，在Schema描述中明确告知LLM关键风险点，让LLM判断哪些信息与风险点相关
-
-
-def build_pp(triples: List[Tuple[str, str, str]], kg, linked_states: Dict[str, Dict] = None, np_facts: List[str] = None, trace: List[Dict] = None, dialogue_text: str = "") -> List[str]:
-    """Generate Path-based Prompts using available schemas.
-
-    中文：实现与论文精神一致的路径证据。
-    - 匹配预定义Schema（通用模板，如 怀孕+症状 -> 药物）
-    - 从NP中提取候选药物（NP已经"发现"了）
-    - 对匹配的Schema，验证候选药物的安全性（KG验证、LLM推理、互联网访问）
-    - 根据Schema类型调整验证重点（不同Schema验证不同的KG信息）
+        候选药物列表（已排序）
     """
     if not isinstance(kg, (DiseaseKBKG, CMeKGKG, MultiKG)):
-        # 简版回退
-        return [f"路径线索: ({s}->{p}->{o})" for s, p, o in triples[: retrieval.topk_pp]]
-
-    lines: List[str] = []
-    seen = set()  # 去重
-
-    # 1. 从NP中提取候选药物（NP已经"发现"了，不需要再查询）
-    candidate_drugs = extract_drugs_from_np(np_facts or [])
-    
-    # 如果NP中没有候选药物，无法进行验证，返回空
-    if not candidate_drugs:
-        if trace is not None:
-            trace.append({"stage": "pp", "note": "没有候选药物，跳过PP生成"})
-        return []
-
-    # 2. 由 LLM 进行 Schema 选择：仅基于对话文本；失败则回退到规则匹配
-    llm_selector = get_llm_caller(expect_json=True)
-    sel_prompt = schema_selector(dialogue_text or "")
-    chosen_schema_names: List[str] = []
-    try:
-        resp = llm_selector(sel_prompt)
-        # 期望是 JSON 数组；兼容返回字符串JSON
-        if isinstance(resp, list):
-            chosen_schema_names = [str(x).strip() for x in resp if str(x).strip()]
-        elif isinstance(resp, str):
-            import json, re
-            txt = resp.strip()
-            try:
-                parsed = json.loads(txt)
-                if isinstance(parsed, list):
-                    chosen_schema_names = [str(x).strip() for x in parsed if str(x).strip()]
-            except Exception:
-                # 正则截取第一个 JSON 数组再尝试解析
-                m = re.search(r"\[[\s\S]*\]", txt)
-                if m:
-                    try:
-                        parsed = json.loads(m.group(0))
-                        if isinstance(parsed, list):
-                            chosen_schema_names = [str(x).strip() for x in parsed if str(x).strip()]
-                    except Exception:
-                        pass
-                # 最后兜底：按逗号/换行切分取合法名
-                if not chosen_schema_names:
-                    raw_tokens = re.split(r"[\n,;\t]", txt)
-                    valid = {
-                        "pregnancy_symptom_medication",
-                        "specific_population_symptom_medication",
-                        "symptom_comorbidity_medication",
-                        "past_medical_history_symptom_medication",
-                        "drug_recommendation_symptom_medication",
-                        "taking_drug_symptom_medication",
-                    }
-                    chosen_schema_names = [t.strip() for t in raw_tokens if t.strip() in valid]
-    except Exception:
-        chosen_schema_names = []
-
-    # 将名称映射为Schema对象；若为空则回退到规则匹配
-    if chosen_schema_names:
-        from .schema import PREDEFINED_SCHEMAS
-        name_to_schema = {s.name: s for s in PREDEFINED_SCHEMAS}
-        matched_schemas = [name_to_schema[n] for n in chosen_schema_names if n in name_to_schema]
-    else:
-        matched_schemas = match_schemas(triples, linked_states)
-    
-    if not matched_schemas:
-        # 没有匹配的Schema，直接返回空（不执行PP）
-        if trace is not None:
-            trace.append({"stage": "pp", "note": "没有匹配的Schema，跳过PP生成"})
         return []
     
-    # 有匹配的Schema，记录匹配信息
+    candidate_drugs = set()
+
+    from .config import retrieval as retrieval_cfg
+    K = max(1, int(getattr(retrieval_cfg, "phase_a_k", 10)))
+
+    # 辅助函数：从事实文本解析药物名
+    def _collect_drugs_from_facts(facts: List[str]) -> List[str]:
+        collected = []
+        for fact in facts or []:
+            if "药物『" in fact:
+                start = fact.index("药物『") + 3
+                end = fact.index("』", start) if "』" in fact[start:] else len(fact)
+                drug_name = fact[start:end].strip()
+                if drug_name:
+                    collected.append(drug_name)
+        return collected
+    
+    # Step1: 诊断疾病 + 原始疾病名称（兜底）
+    diagnosed = patient_state.get("problems", {}).get("diagnosed", []) or []
+    raw_diagnosed = patient_state.get("problems_raw", {}).get("diagnosed", []) or []
+    # 如果 patient_state 中没有保留原始字段，则使用输入的 diagnosed 作为原始
+    if not raw_diagnosed:
+        raw_diagnosed = patient_state.get("problems", {}).get("diagnosed_raw", []) or []
+    if not raw_diagnosed:
+        raw_diagnosed = diagnosed
+
+    disease_queries = []
+    disease_seen = set()
+    for name in list(diagnosed) + list(raw_diagnosed):
+        name = (name or "").strip()
+        if name and name not in disease_seen:
+            disease_seen.add(name)
+            disease_queries.append(name)
+
+    if disease_queries:
+        try:
+            facts = kg.drugs_for_diseases(disease_queries, k=K)
+            for drug_name in _collect_drugs_from_facts(facts):
+                candidate_drugs.add(drug_name)
+        except Exception as e:
+            print(f"[retrieval][phase_a][warn] Failed to query drugs for diseases: {e}")
+
+    # Step2: 告诉症状（不再因为疾病命中而跳过）
+    symptoms = patient_state.get("problems", {}).get("symptoms", []) or []
+    raw_symptoms = patient_state.get("problems_raw", {}).get("symptoms", []) or []
+    if not raw_symptoms:
+        raw_symptoms = patient_state.get("problems", {}).get("symptoms_raw", []) or []
+    if not raw_symptoms:
+        raw_symptoms = symptoms
+
+    symptom_queries = []
+    symptom_seen = set()
+    for name in list(symptoms) + list(raw_symptoms):
+        name = (name or "").strip()
+        if name and name not in symptom_seen:
+            symptom_seen.add(name)
+            symptom_queries.append(name)
+
+    if symptom_queries:
+        try:
+            facts = kg.drugs_for_symptoms(symptom_queries, k=K)
+            for drug_name in _collect_drugs_from_facts(facts):
+                candidate_drugs.add(drug_name)
+        except Exception as e:
+            print(f"[retrieval][phase_a][warn] Failed to query drugs for symptoms: {e}")
+    
+    return sorted(list(candidate_drugs))
+
+
+def _phase_b_collect_all_safety_info(
+    candidate_drugs: List[str],
+    kg,
+    trace: List[Dict] = None
+) -> List[str]:
+    """Phase B 无脑收集模式：直接收集所有候选药物的安全信息，不做匹配判断。
+    
+    中文：这个模式会收集所有候选药物的所有安全信息（注意事项、禁忌、不良反应），
+    不做任何匹配判断，让最终的 LLM 自己去判断这些信息是否与患者约束相关。
+    
+    Args:
+        candidate_drugs: 候选药物列表
+        kg: 知识图谱实例
+        trace: 调试跟踪列表
+    
+    Returns:
+        安全信息列表（带证据ID）
+    """
+    validation_results = []
+    evidence_id = 1
+    
+    # 提取 KG 格式串中的正文
+    def _extract_text(s: str) -> str:
+        if not isinstance(s, str):
+            return ""
+        try:
+            if "『" in s and "』" in s:
+                start = s.rfind("『") + 1
+                end = s.rfind("』")
+                if 0 < start < end:
+                    return s[start:end].strip()
+            if "→" in s:
+                return s.split("→", 1)[-1].strip().strip("『』 ")
+        except Exception:
+            pass
+        return s.strip()
+    
+    print(f"[phase_b][collect_all] 无脑收集模式：开始收集 {len(candidate_drugs)} 个候选药物的所有安全信息")
+    
+    # 对于每个候选药物，收集它的所有安全信息
+    for drug in candidate_drugs:
+        try:
+            # 查询该药物的所有安全信息
+            precautions = kg.precautions_for_drugs([drug], k=50)  # 增加 k 值以获取更多信息
+            contraindications = kg.contraindications_for_drugs([drug], k=50)
+            adverse_reactions = kg.adverse_reactions_for_drugs([drug], k=50)
+            
+            # 收集所有安全文本
+            safety_items: List[Tuple[str, str]] = []
+            for src, arr in (
+                ("precautions", precautions),
+                ("contraindications", contraindications),
+                ("adverseReactions", adverse_reactions)
+            ):
+                for t in arr or []:
+                    text = _extract_text(t)
+                    if text:
+                        safety_items.append((src, text))
+            
+            # 将所有安全信息添加到结果中（不做匹配判断）
+            for src_label, text in safety_items:
+                validation_results.append(
+                    f"[E{evidence_id:04d}] 药物『{drug}』—{src_label}→{text}"
+                )
+                evidence_id += 1
+            
+            print(f"[phase_b][collect_all] 药物『{drug}』: 收集到 {len(safety_items)} 条安全信息")
+        except Exception as e:
+            print(f"[phase_b][collect_all] 收集药物『{drug}』的安全信息失败: {e}")
+            continue
+    
+    print(f"[phase_b][collect_all] 总共收集到 {len(validation_results)} 条安全信息")
+    
     if trace is not None:
         trace.append({
-            "stage": "pp",
-            "matched_schemas": [s.name for s in matched_schemas],
-            "schema_selector": {
-                "prompt": sel_prompt,
-                "chosen": chosen_schema_names,
-            },
+            "stage": "phase_b",
+            "mode": "collect_all",
             "candidate_drugs": candidate_drugs,
+            "validation_results": validation_results
         })
+    
+    return validation_results
 
-    # 3. 提取患者状态（用于Schema特定的验证逻辑）
-    patient_status = extract_patient_status(triples, linked_states)
 
-    # 4. 先查询所有KG信息（所有Schema共享，避免重复查询）
-    # 注意：GAP的核心思想是"定向审查"（Targeted Review），不是"信息倾倒"（Data Dump）
-    # 因此先限制查询数量（topk=10），然后根据Schema的"关键风险点"进行过滤
-    # 这样只返回与关键风险点相关的信息，而不是返回所有信息让LLM自己判断
-    all_kg_results = {}
-    try:
-        ci = getattr(kg, "contraindications_for_drugs", None)
-        ar = getattr(kg, "adverse_reactions_for_drugs", None)
-        ind = getattr(kg, "indications_for_drugs", None)
-        pre = getattr(kg, "precautions_for_drugs", None)
-
-        # 限制查询数量（topk=10），减少无关信息
-        # 后续会根据Schema的"关键风险点"进行进一步过滤
-        if ci:
-            all_kg_results["contraindications"] = ci(candidate_drugs, min(retrieval.topk_pp, 10))
-        if ar:
-            all_kg_results["adverse_reactions"] = ar(candidate_drugs, min(retrieval.topk_pp, 10))
-        if ind:
-            all_kg_results["indications"] = ind(candidate_drugs, min(retrieval.topk_pp, 10))
-        if pre:
-            all_kg_results["precautions"] = pre(candidate_drugs, min(retrieval.topk_pp, 10))
-    except Exception as e:
-        if trace is not None:
-            trace.append({"stage": "pp", "error": f"KG查询失败: {e}"})
+def phase_b_safety_validation(
+    candidate_drugs: List[str],
+    patient_state: Dict,
+    kg,
+    trace: List[Dict] = None
+) -> List[str]:
+    """Phase B: 基于constraints验证候选药物的安全性（PP-like）。
+    
+    Args:
+        candidate_drugs: 候选药物列表
+        patient_state: 结构化患者状态JSON
+        kg: 知识图谱实例
+        trace: 调试跟踪列表
+    
+    Returns:
+        安全验证结果列表（带证据ID）
+    """
+    # 允许鸭子类型KG：只要提供所需方法即可（便于本地桩调试）
+    required_methods = [
+        "precautions_for_drugs",
+        "contraindications_for_drugs",
+        "adverse_reactions_for_drugs",
+    ]
+    if not candidate_drugs or not all(hasattr(kg, m) for m in required_methods):
         return []
-
-    # 5. 根据Schema类型调整验证重点（针对不同的"关键风险点"）
-    for schema in matched_schemas:
-        schema_lines = []  # 当前Schema的验证结果
-        
-        # ============ Schema 1: 怀孕与症状 → 药物 ============
-        # 关键风险点：pregnant (怀孕状态)
-        # 查询重点：候选药物的禁忌症属性，看是否与怀孕状态冲突
-        # GAP"定向审查"：只返回与怀孕相关的安全警告，而不是返回所有信息
-        if schema.name == "pregnancy_symptom_medication":
-            try:
-                # 1. 重点验证禁忌症（特别是对怀孕的禁忌）
-                # 使用关键词过滤：筛选出与怀孕相关的禁忌症
-                pregnancy_keywords = ["孕", "怀孕", "妊娠", "孕妇", "孕期", "哺乳", "哺乳期", "pregnant", "pregnancy"]
-                contraindications = all_kg_results.get("contraindications", [])
-                filtered_contraindications = _filter_kg_facts_by_keywords(contraindications, pregnancy_keywords)
-                schema_lines.extend(filtered_contraindications)
-                
-                # 2. 其次验证注意事项（针对怀孕的注意事项）
-                precautions = all_kg_results.get("precautions", [])
-                filtered_precautions = _filter_kg_facts_by_keywords(precautions, pregnancy_keywords)
-                schema_lines.extend(filtered_precautions)
-                
-                # 3. 最后验证不良反应（次要，但也可能与怀孕相关）
-                adverse_reactions = all_kg_results.get("adverse_reactions", [])
-                filtered_adverse_reactions = _filter_kg_facts_by_keywords(adverse_reactions, pregnancy_keywords)
-                schema_lines.extend(filtered_adverse_reactions)
-            except Exception as e:
-                if trace is not None:
-                    trace.append({"stage": "pp", "error": f"Schema 1验证失败: {e}"})
-        
-        # ============ Schema 2: 特殊人群与症状 → 药物 ============
-        # 关键风险点：elder/infant (老人/婴儿状态)
-        # 查询重点：候选药物的用法/注意事项属性，看是否与特殊人群状态冲突
-        # GAP"定向审查"：只返回与特殊人群相关的安全警告
-        elif schema.name == "specific_population_symptom_medication":
-            try:
-                populations = list(patient_status["specific_populations"])  # ["elder", "infant"]
-                
-                # 根据具体人群类型构建关键词
-                population_keywords = []
-                if "elder" in populations:
-                    population_keywords.extend(["老年", "老人", "高龄", "年长", "elder", "elderly"])
-                if "infant" in populations:
-                    population_keywords.extend(["婴儿", "新生儿", "幼儿", "儿童", "小孩", "婴幼儿", "infant", "child"])
-                
-                # 1. 重点验证注意事项（针对特定人群）
-                precautions = all_kg_results.get("precautions", [])
-                filtered_precautions = _filter_kg_facts_by_keywords(precautions, population_keywords)
-                schema_lines.extend(filtered_precautions)
-                
-                # 2. 其次验证禁忌症（针对特定人群）
-                contraindications = all_kg_results.get("contraindications", [])
-                filtered_contraindications = _filter_kg_facts_by_keywords(contraindications, population_keywords)
-                schema_lines.extend(filtered_contraindications)
-                
-                # 3. 最后验证不良反应（次要）
-                adverse_reactions = all_kg_results.get("adverse_reactions", [])
-                filtered_adverse_reactions = _filter_kg_facts_by_keywords(adverse_reactions, population_keywords)
-                schema_lines.extend(filtered_adverse_reactions)
-            except Exception as e:
-                if trace is not None:
-                    trace.append({"stage": "pp", "error": f"Schema 2验证失败: {e}"})
-        
-        # ============ Schema 3: 症状并发 → 药物 ============
-        # 关键风险点：Symptom_A (患者的并发症症状)
-        # 查询重点：候选药物的禁忌症和不良反应属性，看是否会加重现有症状
-        # GAP"定向审查"：只返回可能与现有症状相关的不良反应和禁忌症
-        elif schema.name == "symptom_comorbidity_medication":
-            try:
-                symptoms = list(patient_status["symptoms"])  # ["腹泻", "腹痛", "肛门疼痛"]
-                
-                # 改进：扩展症状关键词列表（包含相关同义词）
-                # 症状到相关关键词的映射
-                symptom_related_keywords = {
-                    "反酸": ["反酸", "胃", "胃肠道", "消化", "恶心", "呕吐", "胃酸", "胃部", "胃肠", "消化系统"],
-                    "胃痛": ["胃痛", "胃", "胃肠道", "消化", "胃部", "胃肠", "消化系统"],
-                    "腹泻": ["腹泻", "拉肚子", "便", "肠道", "消化", "胃肠道", "胃肠"],
-                    "腹痛": ["腹痛", "肚子痛", "腹部", "肠道", "消化", "胃肠道", "胃肠"],
-                    "恶心": ["恶心", "胃", "胃肠道", "消化", "呕吐", "胃部", "胃肠"],
-                    "呕吐": ["呕吐", "胃", "胃肠道", "消化", "恶心", "胃部", "胃肠"],
-                }
-                
-                # 构建完整的关键词列表
-                symptom_keywords = symptoms.copy()
-                for symptom in symptoms:
-                    symptom_lower = symptom.lower()
-                    # 检查是否有预定义的相关关键词
-                    for key, related in symptom_related_keywords.items():
-                        if key in symptom_lower or symptom_lower in key:
-                            symptom_keywords.extend(related)
-                            break
-                    # 如果没有预定义，尝试基于症状名称推断
-                    if "胃" in symptom_lower or "消化" in symptom_lower:
-                        symptom_keywords.extend(["胃", "胃肠道", "消化", "胃肠", "消化系统"])
-                    if "肠" in symptom_lower:
-                        symptom_keywords.extend(["肠道", "肠", "消化", "胃肠道", "胃肠"])
-                    if "痛" in symptom_lower or "疼" in symptom_lower:
-                        symptom_keywords.extend(["痛", "疼", "疼痛"])
-                
-                # 去重
-                symptom_keywords = list(set(symptom_keywords))
-                
-                # 1. 重点验证不良反应（可能加重现有症状）
-                adverse_reactions = all_kg_results.get("adverse_reactions", [])
-                # 尝试过滤：如果不良反应中包含症状关键词，则保留
-                filtered_adverse_reactions = _filter_kg_facts_by_keywords(adverse_reactions, symptom_keywords)
-                # 如果过滤后为空，至少保留部分不良反应（因为可能通过其他方式相关）
-                if not filtered_adverse_reactions:
-                    # 如果过滤后为空，返回原始列表的前几个（最多5个）
-                    schema_lines.extend(adverse_reactions[:5])
-                else:
-                    schema_lines.extend(filtered_adverse_reactions)
-                
-                # 2. 其次验证禁忌症（看是否会加重现有症状）
-                contraindications = all_kg_results.get("contraindications", [])
-                filtered_contraindications = _filter_kg_facts_by_keywords(contraindications, symptom_keywords)
-                if not filtered_contraindications:
-                    schema_lines.extend(contraindications[:3])
-                else:
-                    schema_lines.extend(filtered_contraindications)
-                
-                # 3. 最后验证注意事项（次要）
-                precautions = all_kg_results.get("precautions", [])
-                filtered_precautions = _filter_kg_facts_by_keywords(precautions, symptom_keywords)
-                if not filtered_precautions:
-                    schema_lines.extend(precautions[:3])
-                else:
-                    schema_lines.extend(filtered_precautions)
-                
-                # 注意：由于症状与不良反应/禁忌症的关联可能较复杂，如果关键词过滤效果不佳，
-                # 可以考虑使用LLM进行语义过滤（但会增加延迟和成本）
-            except Exception as e:
-                if trace is not None:
-                    trace.append({"stage": "pp", "error": f"Schema 3验证失败: {e}"})
-        
-        # ============ Schema 4: 既往病史与症状 → 药物 ============
-        # 关键风险点：Symptom_A (患者的既往病史)
-        # 查询重点：候选药物的禁忌症属性，看是否会加重既往病史
-        # GAP"定向审查"：尝试使用症状关键词过滤，但既往病史可能较复杂，需要LLM判断
-        elif schema.name == "past_medical_history_symptom_medication":
-            try:
-                # 注意：既往病史可能不在当前Gp中，或者难以从禁忌症中直接匹配
-                # 因此先尝试使用症状关键词过滤，如果过滤后为空，则保留部分信息让LLM判断
-                symptoms = list(patient_status["symptoms"])
-                symptom_keywords = symptoms.copy()
-                
-                # 1. 重点验证禁忌症（与既往病史相关）
-                contraindications = all_kg_results.get("contraindications", [])
-                filtered_contraindications = _filter_kg_facts_by_keywords(contraindications, symptom_keywords)
-                if not filtered_contraindications:
-                    # 如果过滤后为空，保留部分禁忌症（最多5个）
-                    schema_lines.extend(contraindications[:5])
-                else:
-                    schema_lines.extend(filtered_contraindications)
-                
-                # 2. 其次验证注意事项
-                precautions = all_kg_results.get("precautions", [])
-                filtered_precautions = _filter_kg_facts_by_keywords(precautions, symptom_keywords)
-                if not filtered_precautions:
-                    schema_lines.extend(precautions[:3])
-                else:
-                    schema_lines.extend(filtered_precautions)
-                
-                # 3. 最后验证不良反应（次要）
-                adverse_reactions = all_kg_results.get("adverse_reactions", [])
-                filtered_adverse_reactions = _filter_kg_facts_by_keywords(adverse_reactions, symptom_keywords)
-                if not filtered_adverse_reactions:
-                    schema_lines.extend(adverse_reactions[:3])
-                else:
-                    schema_lines.extend(filtered_adverse_reactions)
-                
-                # 注意：由于既往病史与禁忌症的关联可能较复杂，如果关键词过滤效果不佳，
-                # 可以考虑使用LLM进行语义过滤（但会增加延迟和成本）
-            except Exception as e:
-                if trace is not None:
-                    trace.append({"stage": "pp", "error": f"Schema 4验证失败: {e}"})
-        
-        # ============ Schema 5: 药物禁忌/推荐与症状 → 药物 ============
-        # 关键风险点：Medication_A (患者正在服用的其他药物，或推荐/禁忌的药物)
-        # 查询重点：候选药物的相互作用属性，看是否与推荐/禁忌药物冲突
-        # GAP"定向审查"：使用推荐/禁忌药物名称作为关键词进行过滤
-        elif schema.name == "drug_recommendation_symptom_medication":
-            try:
-                recommended_drugs = list(patient_status["recommended_drugs"])
-                not_recommended_drugs = list(patient_status["not_recommended_drugs"])
-                all_drugs = recommended_drugs + not_recommended_drugs
-                
-                # 使用推荐/禁忌药物名称作为关键词进行过滤
-                drug_keywords = all_drugs.copy()
-                
-                # 1. 重点验证禁忌症（与推荐/禁忌药物相关）
-                contraindications = all_kg_results.get("contraindications", [])
-                filtered_contraindications = _filter_kg_facts_by_keywords(contraindications, drug_keywords)
-                if not filtered_contraindications:
-                    schema_lines.extend(contraindications[:5])
-                else:
-                    schema_lines.extend(filtered_contraindications)
-                
-                # 2. 其次验证不良反应
-                adverse_reactions = all_kg_results.get("adverse_reactions", [])
-                filtered_adverse_reactions = _filter_kg_facts_by_keywords(adverse_reactions, drug_keywords)
-                if not filtered_adverse_reactions:
-                    schema_lines.extend(adverse_reactions[:5])
-                else:
-                    schema_lines.extend(filtered_adverse_reactions)
-                
-                # 3. 最后验证注意事项
-                precautions = all_kg_results.get("precautions", [])
-                filtered_precautions = _filter_kg_facts_by_keywords(precautions, drug_keywords)
-                if not filtered_precautions:
-                    schema_lines.extend(precautions[:3])
-                else:
-                    schema_lines.extend(filtered_precautions)
-                
-                # 注意：由于药物相互作用可能较复杂，如果关键词过滤效果不佳，
-                # 可以考虑使用LLM进行语义过滤（但会增加延迟和成本）
-            except Exception as e:
-                if trace is not None:
-                    trace.append({"stage": "pp", "error": f"Schema 5验证失败: {e}"})
-        
-        # ============ Schema 6: 已服药物与症状 → 药物 ============
-        # 关键风险点：Medication_A (患者正在服用的其他药物)
-        # 查询重点：候选药物的相互作用属性，看是否与已服药物冲突（最重要！）
-        # GAP"定向审查"：优先返回可能与已服药物相关的不良反应和禁忌症
-        elif schema.name == "taking_drug_symptom_medication":
-            try:
-                taking_drugs = list(patient_status["taking_drugs"])  # ["诺氟沙星胶囊", "思密达"]
-                symptoms = list(patient_status["symptoms"])
-                
-                # 使用已服药物名称作为关键词进行过滤
-                # 注意：不良反应或禁忌症中可能包含药物相关的关键词
-                drug_keywords = taking_drugs.copy()
-                
-                # 1. 重点验证不良反应（可能加重症状或与已服药物冲突）
-                adverse_reactions = all_kg_results.get("adverse_reactions", [])
-                # 尝试过滤：如果不良反应中包含已服药物关键词，则保留
-                filtered_adverse_reactions = _filter_kg_facts_by_keywords(adverse_reactions, drug_keywords)
-                # 如果过滤后为空，至少保留部分不良反应（因为可能通过其他方式相关）
-                if not filtered_adverse_reactions:
-                    schema_lines.extend(adverse_reactions[:5])
-                else:
-                    schema_lines.extend(filtered_adverse_reactions)
-                
-                # 2. 其次验证禁忌症（可能与已服药物相关）
-                contraindications = all_kg_results.get("contraindications", [])
-                filtered_contraindications = _filter_kg_facts_by_keywords(contraindications, drug_keywords)
-                if not filtered_contraindications:
-                    schema_lines.extend(contraindications[:3])
-                else:
-                    schema_lines.extend(filtered_contraindications)
-                
-                # 3. 最后验证注意事项
-                precautions = all_kg_results.get("precautions", [])
-                filtered_precautions = _filter_kg_facts_by_keywords(precautions, drug_keywords)
-                if not filtered_precautions:
-                    schema_lines.extend(precautions[:3])
-                else:
-                    schema_lines.extend(filtered_precautions)
-                
-                # 注意：由于药物相互作用可能较复杂，如果关键词过滤效果不佳，
-                # 可以考虑使用LLM进行语义过滤（但会增加延迟和成本）
-                # 已服药物信息已包含在LLM推理提示中（status_desc），LLM可以据此判断
-            except Exception as e:
-                if trace is not None:
-                    trace.append({"stage": "pp", "error": f"Schema 6验证失败: {e}"})
-        
-        # 默认处理：如果Schema类型未匹配，执行基本验证
-        else:
-            try:
-                # 默认验证：禁忌症、不良反应、注意事项
-                contraindications = all_kg_results.get("contraindications", [])
-                adverse_reactions = all_kg_results.get("adverse_reactions", [])
-                precautions = all_kg_results.get("precautions", [])
-                
-                schema_lines.extend(contraindications)
-                schema_lines.extend(adverse_reactions)
-                schema_lines.extend(precautions)
-            except Exception as e:
-                if trace is not None:
-                    trace.append({"stage": "pp", "error": f"默认验证失败: {e}"})
-        
-        # 将当前Schema的验证结果添加到总结果中
-        for fact in schema_lines:
-            if fact not in seen:
-                seen.add(fact)
-                lines.append(fact)
-
-    # 5. LLM推理：对每个匹配的Schema，使用表6的提示进行推理
-    if matched_schemas:
+    
+    # 检查是否启用"无脑收集"模式（直接收集所有安全信息，不做匹配判断）
+    from .config import retrieval as retrieval_cfg
+    if retrieval_cfg.phase_b_collect_all:
+        return _phase_b_collect_all_safety_info(candidate_drugs, kg, trace)
+    
+    constraints = patient_state.get("constraints", {})
+    validation_results = []
+    evidence_id = 1
+    # 统一相似度阈值（可迁移到 config）
+    SIM_THRESHOLD = 0.50
+    # 使用离线向量索引（FAISS）：data/embeddings/{kg}.index + *_mapping.json
+    # 流程：1. 在线编码患者查询词 2. 从 FAISS 获取安全文本的离线向量 3. 计算相似度
+    # 如果 FAISS 未命中，回退到字符串包含匹配
+    encoder = None  # 用于在线编码患者查询词（安全文本使用离线向量）
+    searcher_cmekg = None
+    searcher_dkb = None
+    try:
+        # 两库均尝试加载（若配置关闭或文件缺失，将返回 None）
+        searcher_cmekg = _get_vector_searcher("cmekg")
+    except Exception:
+        searcher_cmekg = None
+    try:
+        searcher_dkb = _get_vector_searcher("diseasekb")
+    except Exception:
+        searcher_dkb = None
+    # 编码器用于在线编码患者查询词（所有节点都已离线embedding，安全文本使用离线向量）
+    if 'EmbeddingEncoder' in globals() and EmbeddingEncoder is not None:
         try:
-            caller = get_llm_caller(expect_json=False)
-            for schema in matched_schemas:
-                # 构建推理问题（基于Schema模式和患者状态）
-                status_desc = []
-                if patient_status["specific_populations"]:
-                    status_desc.append(f"特定人群: {', '.join(patient_status['specific_populations'])}")
-                if patient_status["symptoms"]:
-                    status_desc.append(f"症状: {', '.join(list(patient_status['symptoms'])[:3])}")
-                if patient_status["diseases"]:
-                    status_desc.append(f"疾病: {', '.join(list(patient_status['diseases'])[:3])}")
-                if patient_status["taking_drugs"]:
-                    status_desc.append(f"已服药物: {', '.join(list(patient_status['taking_drugs'])[:3])}")
-                question = f"{schema.description}。患者信息：{'; '.join(status_desc)}。候选药物：{', '.join(candidate_drugs[:3])}"
-                reasoning_prompt = table6_reasoning(question)
-                reasoning = caller(reasoning_prompt).strip()
-                if reasoning:
-                    fact = f"[LLM推理-{schema.name}] {reasoning}"
-                    if fact not in seen:
-                        seen.add(fact)
-                        lines.append(fact)
+            encoder = EmbeddingEncoder()
+        except Exception:
+            encoder = None
+
+    # 提取 KG 格式串中的正文，例如：
+    # "药物『X』—contraindications→『正文』" → 返回 "正文"
+    def _extract_text(s: str) -> str:
+        if not isinstance(s, str):
+            return ""
+        # 优先取最后一对『...』内的内容
+        try:
+            if "『" in s and "』" in s:
+                start = s.rfind("『") + 1
+                end = s.rfind("』")
+                if 0 < start < end:
+                    return s[start:end].strip()
+            # 次优：按箭头切分取右侧
+            if "→" in s:
+                return s.split("→", 1)[-1].strip().strip("『』 ")
+        except Exception:
+            pass
+        return s.strip()
+
+    # 使用离线向量索引进行语义匹配：返回是否命中
+    # 正确流程：1. 在线编码患者查询词 2. 从 FAISS 获取安全文本的离线向量 3. 计算相似度
+    def _semantic_hit_via_index(query_term: str, safety_texts: List[str], constraint_type: str = "约束") -> tuple:
+        """
+        使用离线向量索引进行语义匹配。
+        
+        流程：
+        1. 在线编码患者查询词（如"青霉素"）
+        2. 从 FAISS 索引中获取安全文本名称对应的离线向量
+        3. 计算查询向量与安全文本向量的相似度
+        4. 如果相似度 >= 阈值，返回命中
+        
+        Args:
+            query_term: 患者查询词（如"青霉素"、"乙肝"）
+            safety_texts: 从 Neo4j 获取的安全文本名称列表（如["对青霉素类药物过敏者禁用"]）
+            constraint_type: 约束类型（用于日志输出，如"过敏"、"既往病史"）
+        
+        Returns:
+            (hit, matched_name, score) 元组
+        """
+        if not query_term or not safety_texts or not encoder:
+            if not encoder:
+                print(f"[phase_b][faiss][{constraint_type}] 编码器不可用，跳过 FAISS 匹配")
+            return (False, None, 0.0)
+        
+        print(f"[phase_b][faiss][{constraint_type}] 查询词: '{query_term}'")
+        print(f"[phase_b][faiss][{constraint_type}] Neo4j 安全文本数量: {len(safety_texts)}")
+        
+        # 1. 在线编码患者查询词
+        try:
+            import numpy as np
+            query_vec = np.array(encoder.encode_single(query_term), dtype=np.float32)
+            # 归一化（用于余弦相似度）
+            query_norm = query_vec / (np.linalg.norm(query_vec) + 1e-8)
+            print(f"[phase_b][faiss][{constraint_type}] 在线编码查询词完成，向量维度: {query_vec.shape[0]}")
         except Exception as e:
-            if trace is not None:
-                trace.append({"stage": "pp", "error": f"LLM推理失败: {e}"})
+            print(f"[phase_b][faiss][{constraint_type}] 在线编码查询词失败: {e}")
+            return (False, None, 0.0)
+        
+        # 2. 从 FAISS 索引中获取安全文本的离线向量（优先 CMeKG，再 DiseaseKB）
+        best = (False, None, 0.0)
+        
+        for kg_name, searcher in [("cmekg", searcher_cmekg), ("diseasekb", searcher_dkb)]:
+            if searcher is None:
+                print(f"[phase_b][faiss][{constraint_type}] {kg_name} 索引不可用，跳过")
+                continue
+            try:
+                print(f"[phase_b][faiss][{constraint_type}] 从 {kg_name} 索引获取安全文本向量...")
+                # 从 FAISS 索引中获取这些安全文本名称对应的向量
+                safety_vectors = searcher.get_vectors_by_names(safety_texts)
+                
+                found_count = sum(1 for v in safety_vectors if v is not None)
+                print(f"[phase_b][faiss][{constraint_type}] {kg_name} 索引中找到 {found_count}/{len(safety_texts)} 个安全文本向量")
+                
+                # 3. 计算相似度
+                for i, safety_vec in enumerate(safety_vectors):
+                    if safety_vec is None:
+                        continue
+                    
+                    safety_name = safety_texts[i]
+                    
+                    # 归一化安全文本向量
+                    safety_norm = safety_vec / (np.linalg.norm(safety_vec) + 1e-8)
+                    
+                    # 计算余弦相似度（内积，因为已归一化）
+                    similarity = float(np.dot(query_norm, safety_norm))
+                    
+                    print(f"[phase_b][faiss][{constraint_type}]   '{query_term}' vs '{safety_name[:50]}...' = {similarity:.4f} {'✅ 命中' if similarity >= SIM_THRESHOLD else '❌ 未命中'}")
+                    
+                    # 如果相似度 >= 阈值且比之前的最佳结果更好，更新
+                    if similarity >= SIM_THRESHOLD and similarity > best[2]:
+                        best = (True, safety_name, similarity)
+                        print(f"[phase_b][faiss][{constraint_type}] 更新最佳匹配: '{safety_name}' (相似度: {similarity:.4f})")
+            except Exception as e:
+                print(f"[phase_b][faiss][{constraint_type}] {kg_name} 索引处理失败: {e}")
+                continue
+        
+        if best[0]:
+            print(f"[phase_b][faiss][{constraint_type}] ✅ 最终命中: '{best[1]}' (相似度: {best[2]:.4f})")
+        else:
+            print(f"[phase_b][faiss][{constraint_type}] ❌ 未命中（所有相似度 < {SIM_THRESHOLD}），将回退到字符串匹配")
+        
+        return best
+    
+    # 1. 检查过敏（Neo4j 粗筛 + 向量精筛）
+    allergies = constraints.get("allergies", [])
+    if allergies:
+        try:
+            # 预处理过敏词
+            query_terms = [a for a in allergies if isinstance(a, str) and a.strip()]
 
-    # 6. 互联网访问（可选，暂时不实现）
-    # 注意：互联网访问功能是论文中提到的PP验证方式之一，但目前暂不实现
-    # 如果需要，可以通过调用外部API（如药品数据库API）来实现
+            for drug in candidate_drugs:
+                print(f"[phase_b][过敏] 检查药物『{drug}』")
+                precautions = kg.precautions_for_drugs([drug], k=20)
+                contraindications = kg.contraindications_for_drugs([drug], k=20)
+                adverse_reactions = kg.adverse_reactions_for_drugs([drug], k=20)
 
-    # 7. 为 PP 事实分配稳定的证据ID，并返回带ID的可读文本
-    id_prefix = "E"
-    numbered: List[str] = []
-    for idx, text in enumerate(lines, start=1):
-        evid = f"{id_prefix}{idx:04d}"
-        numbered.append(f"[{evid}] {text}")
+                safety_items: List[Tuple[str, str]] = []
+                for src, arr in (("precautions", precautions), ("contraindications", contraindications), ("adverseReactions", adverse_reactions)):
+                    for t in arr or []:
+                        text = _extract_text(t)
+                        if text:
+                            safety_items.append((src, text))
+                
+                print(f"[phase_b][过敏] Neo4j 粗筛结果: precautions={len(precautions)}, contraindications={len(contraindications)}, adverseReactions={len(adverse_reactions)}, 提取后安全文本: {len(safety_items)}")
+                
+                if not safety_items or not query_terms:
+                    if not safety_items:
+                        print(f"[phase_b][过敏] 药物『{drug}』无安全文本，跳过")
+                    continue
 
+                # 先尝试离线索引匹配（精确名称重合）
+                print(f"[phase_b][过敏] 开始 FAISS 语义匹配，安全文本数量: {len(safety_items)}")
+                hit, hit_name, hit_score = (False, None, 0.0)
+                try:
+                    hit, hit_name, hit_score = _semantic_hit_via_index(
+                        query_term=query_terms[0] if len(query_terms) == 1 else " ".join(query_terms),
+                        safety_texts=[t for _, t in safety_items],
+                        constraint_type="过敏"
+                    )
+                except Exception as e:
+                    print(f"[phase_b][过敏] FAISS 匹配异常: {e}")
+                    pass
+                if hit:
+                    # 命中即记证据
+                    src_label = next((src for src, t in safety_items if t == hit_name), "precautions")
+                    validation_results.append(
+                        f"[E{evidence_id:04d}] 药物『{drug}』—{src_label}→{hit_name} (faiss.sim={hit_score:.2f} vs 过敏)"
+                    )
+                    evidence_id += 1
+                    continue
+
+                # 兜底：字符串包含（FAISS 未命中时）
+                for src_label, text in safety_items:
+                    for q_text in query_terms:
+                        if q_text in text or any(k in text for k in ["过敏", "禁忌", "禁用"]):
+                            validation_results.append(f"[E{evidence_id:04d}] 药物『{drug}』—{src_label}→{text}")
+                            evidence_id += 1
+                            break
+        except Exception as e:
+            print(f"[retrieval_v2][phase_b][warn] Failed to check allergies (semantic): {e}")
+    
+    # 2. 检查特殊人群状态（Neo4j 粗筛 + 向量精筛）
+    status = constraints.get("status", [])
+    if status:
+        try:
+            status_keywords = {
+                "pregnant": ["孕", "怀孕", "妊娠", "孕妇", "哺乳", "哺乳期"],
+                "infant": ["婴儿", "新生儿", "幼儿", "儿童", "小孩", "婴幼儿", "宝宝"],
+                "elderly": ["老年", "老人", "高龄", "年长"]
+            }
+            query_terms = []
+            for s in status:
+                query_terms.extend(status_keywords.get(s, []))
+            query_terms = [t for t in query_terms if t]
+
+            for drug in candidate_drugs:
+                precautions = kg.precautions_for_drugs([drug], k=20)
+                contraindications = kg.contraindications_for_drugs([drug], k=20)
+                safety_items: List[Tuple[str, str]] = []
+                for src, arr in (("precautions", precautions), ("contraindications", contraindications)):
+                    for t in arr or []:
+                        text = _extract_text(t)
+                        if text:
+                            safety_items.append((src, text))
+                if not safety_items or not query_terms:
+                    continue
+
+                # 先尝试离线索引匹配
+                print(f"[phase_b][特殊人群] 检查药物『{drug}』，安全文本数量: {len(safety_items)}")
+                hit, hit_name, hit_score = (False, None, 0.0)
+                try:
+                    hit, hit_name, hit_score = _semantic_hit_via_index(
+                        query_term=" ".join(query_terms),
+                        safety_texts=[t for _, t in safety_items],
+                        constraint_type="特殊人群"
+                    )
+                except Exception as e:
+                    print(f"[phase_b][特殊人群] FAISS 匹配异常: {e}")
+                    pass
+                if hit:
+                    src_label = next((src for src, t in safety_items if t == hit_name), "precautions")
+                    validation_results.append(
+                        f"[E{evidence_id:04d}] 药物『{drug}』—{src_label}→{hit_name} (faiss.sim={hit_score:.2f} vs 特殊人群)"
+                    )
+                    evidence_id += 1
+                    continue
+
+                # 兜底：字符串包含（FAISS 未命中时）
+                for src_label, text in safety_items:
+                    if any(kw in text for kw in query_terms):
+                        validation_results.append(f"[E{evidence_id:04d}] 药物『{drug}』—{src_label}→{text}")
+                        evidence_id += 1
+        except Exception as e:
+            print(f"[retrieval_v2][phase_b][warn] Failed to check status (semantic): {e}")
+    
+    # 3. 检查既往病史（Neo4j 粗筛 + 向量精筛）
+    past_history = constraints.get("past_history", [])
+    if past_history:
+        try:
+            # 预处理既往病史文本
+            history_texts: List[str] = [h for h in past_history if isinstance(h, str) and h.strip()]
+
+            for drug in candidate_drugs:
+                # Neo4j 粗筛：取该药物直连的安全文本（注意/禁忌/不良反应）
+                precautions = kg.precautions_for_drugs([drug], k=20)
+                contraindications = kg.contraindications_for_drugs([drug], k=20)
+                adverse_reactions = kg.adverse_reactions_for_drugs([drug], k=20)
+
+                # 整理候选安全文本
+                safety_items: List[Tuple[str, str]] = []  # (src, text)
+                for src, arr in (("precautions", precautions), ("contraindications", contraindications), ("adverseReactions", adverse_reactions)):
+                    for t in arr or []:
+                        text = _extract_text(t)
+                        if text:
+                            safety_items.append((src, text))
+                if not safety_items or not history_texts:
+                    continue
+
+                # 语义精筛
+                # 先尝试离线索引匹配
+                print(f"[phase_b][既往病史] 检查药物『{drug}』，安全文本数量: {len(safety_items)}")
+                hit, hit_name, hit_score = (False, None, 0.0)
+                try:
+                    hit, hit_name, hit_score = _semantic_hit_via_index(
+                        query_term=history_texts[0] if len(history_texts) == 1 else " ".join(history_texts),
+                        safety_texts=[t for _, t in safety_items],
+                        constraint_type="既往病史"
+                    )
+                except Exception as e:
+                    print(f"[phase_b][既往病史] FAISS 匹配异常: {e}")
+                    pass
+                if hit:
+                    src_label = next((src for src, t in safety_items if t == hit_name), "contraindications")
+                    validation_results.append(
+                        f"[E{evidence_id:04d}] 药物『{drug}』—{src_label}→{hit_name} (faiss.sim={hit_score:.2f} vs 既往病史)"
+                    )
+                    evidence_id += 1
+                    continue
+
+                # 兜底：字符串包含（FAISS 未命中时）
+                for src_label, text in safety_items:
+                    for h_text in history_texts:
+                        if h_text in text:
+                            validation_results.append(
+                                f"[E{evidence_id:04d}] 药物『{drug}』—{src_label}→{text} (string match vs 既往病史『{h_text}』)"
+                            )
+                            evidence_id += 1
+                            break
+        except Exception as e:
+            print(f"[retrieval][phase_b][warn] Failed to check past history (semantic): {e}")
+    
+    # 4. 检查药物相互作用（正在服用的药物：Neo4j 粗筛 + 向量精筛）
+    taking_drugs = constraints.get("taking_drugs", [])
+    if taking_drugs:
+        try:
+            taking_drug_names = [d.get("name", "") if isinstance(d, dict) else str(d) for d in taking_drugs]
+            taking_drug_names = [n for n in taking_drug_names if n]
+
+            for drug in candidate_drugs:
+                adverse_reactions = kg.adverse_reactions_for_drugs([drug], k=20)
+                contraindications = kg.contraindications_for_drugs([drug], k=20)
+                safety_items: List[Tuple[str, str]] = []
+                for src, arr in (("adverseReactions", adverse_reactions), ("contraindications", contraindications)):
+                    for t in arr or []:
+                        text = _extract_text(t)
+                        if text:
+                            safety_items.append((src, text))
+                if not safety_items or not taking_drug_names:
+                    continue
+
+                # 对每个正在服用的药物分别进行匹配（而不是拼接成一个字符串）
+                print(f"[phase_b][正在服用] 检查药物『{drug}』，安全文本数量: {len(safety_items)}，正在服用药物数量: {len(taking_drug_names)}")
+                
+                # 遍历每个正在服用的药物，分别进行语义匹配
+                for taking_drug_name in taking_drug_names:
+                    hit, hit_name, hit_score = (False, None, 0.0)
+                    try:
+                        hit, hit_name, hit_score = _semantic_hit_via_index(
+                            query_term=taking_drug_name,  # 单独匹配每个药物
+                            safety_texts=[t for _, t in safety_items],
+                            constraint_type="正在服用"
+                        )
+                    except Exception as e:
+                        print(f"[phase_b][正在服用] FAISS 匹配异常（药物『{taking_drug_name}』）: {e}")
+                        pass
+                    
+                    if hit:
+                        src_label = next((src for src, t in safety_items if t == hit_name), "adverseReactions")
+                        validation_results.append(
+                            f"[E{evidence_id:04d}] 药物『{drug}』—{src_label}→{hit_name} (faiss.sim={hit_score:.2f} vs 正在服用『{taking_drug_name}』)"
+                        )
+                        evidence_id += 1
+                        continue  # 找到匹配后，继续检查下一个正在服用的药物
+
+                    # 兜底：字符串包含（FAISS 未命中时）
+                    for src_label, text in safety_items:
+                        if taking_drug_name in text or "相互作用" in text:
+                            validation_results.append(
+                                f"[E{evidence_id:04d}] 药物『{drug}』—{src_label}→{text} (string match vs 正在服用『{taking_drug_name}』)"
+                            )
+                            evidence_id += 1
+                            break  # 找到一个匹配就跳出内层循环
+        except Exception as e:
+            print(f"[retrieval_v2][phase_b][warn] Failed to check drug interactions (semantic): {e}")
+    
+    # 5. 检查不推荐的药物
+    not_recommended = constraints.get("not_recommended_drugs", [])
+    if not_recommended:
+        for drug in candidate_drugs:
+            for nr_drug in not_recommended:
+                if nr_drug in drug or drug in nr_drug:
+                    # 如果候选药物中包含不推荐的药物，添加警告
+                    validation_results.append(f"[E{evidence_id:04d}] [警告] 药物『{drug}』与不推荐药物『{nr_drug}』相关，需谨慎使用。")
+                    evidence_id += 1
+    
     if trace is not None:
-        trace.append({"stage": "pp", "facts": numbered})
+        trace.append({
+            "stage": "phase_b",
+            "candidate_drugs": candidate_drugs,
+            "constraints": constraints,
+            "validation_results": validation_results
+        })
+    
+    return validation_results
 
-    return numbered[: retrieval.topk_pp]

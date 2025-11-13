@@ -114,18 +114,29 @@ def build_index_for_kg(kg_name: str, db_config: dict, entity_labels: list, outpu
 # KG节点类型配置（根据实际KG结构配置）
 # 只索引会用于实体链接和查询的节点类型
 KG_ENTITY_LABELS = {
+    # CMeKG：尽量覆盖会在实体链接与查询中使用到的标签
     "cmekg": [
-        "Disease",    # 疾病（核心）
-        "Symptom",    # 症状（核心）
-        "Drug",       # 药物（核心）
-        # 注意：CMeKG可能还有其他相关节点，但实体链接主要用这三个
+        # 核心三类
+        "Disease", "Symptom", "Drug",
+        # 医学属性/病理/病因/演化
+        "Attribute", "Pathogenesis", "Pathophysiology", "Stage", "Type",
+        # 诊断/检查/部位/科室
+        "Diagnosis", "Check", "CheckSubject", "Department", "DiseaseSite",
+        # 关联关系
+        "RelatedDisease", "RelatedSymptom", "RelatedTo",
+        # 治疗/疗法/用药/方案
+        "Treatment", "TreatmentPrograms", "DrugTherapy", "AdjuvantTherapy", "Operation","AuxiliaryExamination",
+        # 药学信息
+        "Indications", "Precautions", "AdverseReactions", "Ingredients", "OTC",
+        # 流行病学/预后
+        "Infectious", "DiseaseRate", "Prognosis", "PrognosticSurvivalTime",
+        # 其他常见类别
+        "Complication", "SymptomAndSign", "SpreadWay", "Subject", "MultipleGroups", "PathologicalType",
     ],
+    # DiseaseKB：覆盖可见的主要标签
     "diseasekb": [
-        "Disease",    # 疾病（核心）
-        "Symptom",    # 症状（核心）
-        "Drug",       # 药物（核心）
-        # DiseaseKB的节点类型：Check, Cure, Department, Disease, Drug, Food, Producer, Symptom
-        # 但实体链接主要用这三个
+        "Disease", "Symptom", "Drug",
+        "Check", "Cure", "Department", "Food", "Producer"
     ]
 }
 

@@ -138,9 +138,9 @@ class DiseaseKBKG(_BaseNeo4jKG):
         with self._session() as sess:
             return query.query_diseasekb_diet_for_diseases(sess, list(disease_names), k) if query else []
 
-    def resolve_entity(self, name: str) -> Dict:
+    def resolve_entity(self, name: str, allowed_labels: List[str] = None) -> Dict:
         with self._session() as sess:
-            return query.query_diseasekb_resolve_entity(sess, name) if query else {}
+            return query.query_diseasekb_resolve_entity(sess, name, allowed_labels=allowed_labels) if query else {}
 
     # 结构化三元组
     def drugs_for_diseases_struct(self, disease_names: Sequence[str], k: int) -> List[Tuple[str, str, str]]:
@@ -198,9 +198,9 @@ class CMeKGKG(_BaseNeo4jKG):
         with self._session() as sess:
             return query.query_cmekg_diet_for_diseases(sess, list(disease_names), k) if query else []
 
-    def resolve_entity(self, name: str) -> Dict:
+    def resolve_entity(self, name: str, allowed_labels: List[str] = None) -> Dict:
         with self._session() as sess:
-            return query.query_cmekg_resolve_entity(sess, name) if query else {}
+            return query.query_cmekg_resolve_entity(sess, name, allowed_labels=allowed_labels) if query else {}
 
     # 结构化三元组
     def drugs_for_diseases_struct(self, disease_names: Sequence[str], k: int) -> List[Tuple[str, str, str]]:
@@ -530,13 +530,17 @@ class MultiKG:
                     return kg.diet_for_diseases(names, k)
         return self._execute_query_by_kg(_query_by_kg, disease_names, k)
     
-    def resolve_entity(self, name: str) -> Dict:
+    def resolve_entity(self, name: str, allowed_labels: List[str] = None) -> Dict:
         """Resolve entity according to integration strategy.
         
         中文：按集成策略进行实体链接：
         - union：同时查询两个KG，若都命中优先返回CMeKG；否则返回命中的那个
         - primary_fallback：先CMeKG，失败再DiseaseKB（原行为）
         - cmekg_only / diseasekb_only：仅查询指定KG
+        
+        Args:
+            name: 实体名称
+            allowed_labels: 允许的节点标签列表（如 ["Disease", "Symptom"]），None 表示不限制
         """
         strategy = self._strategy
 
@@ -544,7 +548,7 @@ class MultiKG:
         if strategy == "cmekg_only" and self._primary:
             try:
                 with self._primary._session() as sess:
-                    return query.query_cmekg_resolve_entity(sess, name) if query else {}
+                    return query.query_cmekg_resolve_entity(sess, name, allowed_labels=allowed_labels) if query else {}
             except Exception:
                 return {}
 
@@ -552,7 +556,7 @@ class MultiKG:
         if strategy == "diseasekb_only" and self._fallback:
             try:
                 with self._fallback._session() as sess:
-                    return query.query_diseasekb_resolve_entity(sess, name) if query else {}
+                    return query.query_diseasekb_resolve_entity(sess, name, allowed_labels=allowed_labels) if query else {}
             except Exception:
                 return {}
 
@@ -599,7 +603,7 @@ class MultiKG:
             try:
                 if self._primary:
                     with self._primary._session() as sess:
-                        cmekg_res = query.query_cmekg_resolve_entity(sess, name) if query else {}
+                        cmekg_res = query.query_cmekg_resolve_entity(sess, name, allowed_labels=allowed_labels) if query else {}
                         if cmekg_res:
                             cmekg_res.setdefault("kg_source", "cmekg")
             except Exception:
@@ -607,7 +611,7 @@ class MultiKG:
             try:
                 if self._fallback:
                     with self._fallback._session() as sess:
-                        dkb_res = query.query_diseasekb_resolve_entity(sess, name) if query else {}
+                        dkb_res = query.query_diseasekb_resolve_entity(sess, name, allowed_labels=allowed_labels) if query else {}
                         if dkb_res:
                             dkb_res.setdefault("kg_source", "diseasekb")
             except Exception:
@@ -623,9 +627,9 @@ class MultiKG:
             try:
                 with self._primary._session() as sess:
                     if query:
-                        result = query.query_cmekg_resolve_entity(sess, name)
+                        result = query.query_cmekg_resolve_entity(sess, name, allowed_labels=allowed_labels)
                     else:
-                        result = self._primary.resolve_entity(name)
+                        result = self._primary.resolve_entity(name, allowed_labels=allowed_labels)
                     if result:
                         result.setdefault("kg_source", "cmekg")
                         return result
@@ -635,9 +639,9 @@ class MultiKG:
             try:
                 with self._fallback._session() as sess:
                     if query:
-                        result = query.query_diseasekb_resolve_entity(sess, name)
+                        result = query.query_diseasekb_resolve_entity(sess, name, allowed_labels=allowed_labels)
                     else:
-                        result = self._fallback.resolve_entity(name)
+                        result = self._fallback.resolve_entity(name, allowed_labels=allowed_labels)
                     if result:
                         result.setdefault("kg_source", "diseasekb")
                         return result

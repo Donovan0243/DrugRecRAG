@@ -57,6 +57,7 @@ def main():
     dialogue = args.dialog
     if not dialogue:
         dialogue = sys.stdin.read()
+    
     result = run_gap(dialogue_text=dialogue)
     print(json.dumps(result, ensure_ascii=False, indent=2))
 

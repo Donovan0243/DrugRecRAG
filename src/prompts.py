@@ -1,119 +1,99 @@
-"""Prompt templates (Tables 4/5/6/8) adapted from README summary.
+"""Prompt templates for new GAP pipeline.
 
-中文说明：本模块提供固定英文模板与简易填充函数，严格控制占位与长度。
+中文说明：新版流程的提示模板：患者状态提取和最终推理。
 """
 
 from typing import List, Dict
 
-
-def table4_ner(context: str) -> str:
-    # 中文：表4 NER 提示（中文版本，输出为实体列表）
+def patient_state_extractor(dialogue_text: str) -> str:
+    """新版：步骤1 - 从对话直接提取结构化患者状态JSON。
+    
+    中文：让LLM从对话中直接解析出结构化JSON，包含problems和constraints。
+    """
     return (
-        "你是一名医疗领域的实体识别标注员。给定一段中文医疗对话，请识别并返回其中出现的‘疾病/症状/药物’实体，使用列表格式输出。\n"
-        "输出格式: [\"实体1\", \"实体2\", ...]\n\n"
-        f"对话内容:\n{context}\n"
-        "请只输出列表（不要添加其他说明）："
+        "你是一名专业的医疗信息提取助手。请从以下中文医疗对话中，提取患者的关键信息并输出为结构化JSON。\n\n"
+        "输出格式（必须严格遵循，所有字段都必须存在，即使为空数组）：\n"
+        "{\n"
+        '  "problems": {\n'
+        '    "diagnosed": ["医生诊断的疾病1", "疾病2", ...],  // 医生明确诊断的疾病\n'
+        '    "symptoms": ["症状1", "症状2", ...]              // 患者描述的症状\n'
+        "  },\n"
+        '  "constraints": {\n'
+        '    "allergies": ["过敏药物1", "过敏药物2", ...],                    // 患者对哪些药物过敏\n'
+        '    "status": ["pregnant", "infant", "elderly"],                     // 特殊人群状态（pregnant/infant/elderly），没有则空数组\n'
+        '    "past_history": ["既往病史1", "既往病史2", ...],                 // 既往病史（如"乙肝"、"高血压"等）\n'
+        '    "taking_drugs": [                                                // 正在服用的药物\n'
+        '      {"name": "药物名", "status": "no_effect|effective|unknown"}  // status: 没效果/有效/未知\n'
+        "    ],\n"
+        '    "not_recommended_drugs": ["不推荐药物1", ...]                    // 医生明确不推荐的药物\n'
+        "  }\n"
+        "}\n\n"
+        "提取规则：\n"
+        "1. diagnosed: 仅提取医生明确诊断的疾病（如'医生诊断其为xxx'、'是xxx'）\n"
+        "2. symptoms: 提取患者描述的症状（如'头痛'、'反酸'、'肚子疼'）\n"
+        "3. allergies: 提取明确提及的过敏药物（如'对青霉素过敏'、'对xxx过敏'）\n"
+        "4. status: 提取特殊人群信息（'孕妇'→pregnant, '宝宝'、'婴儿'、'X个月'→infant, '老人'→elderly）\n"
+        "5. past_history: 提取既往病史（如'以前有过乙肝'、'既往xxx病史'）\n"
+        "6. taking_drugs: 提取正在服用的药物及其效果（如'吃了xxx但没效果'→status='no_effect'）\n"
+        "7. not_recommended_drugs: 提取医生明确不推荐的药物（如'不能用xxx'、'xxx不能用'）\n\n"
+        f"对话内容:\n{dialogue_text}\n\n"
+        "请只输出JSON对象，不要添加任何解释或Markdown格式："
     )
 
 
-def table5_slot(context: str, target_entity: str) -> str:
-    # 中文：表5 概念状态判断提示（中文版本，JSON 字段名保持英文以便解析）
-    return (
-        "你是一名资深医生。请基于以下中文医疗对话，判断给定疾病/症状的相关状态，并用 JSON 返回。\n"
-        "JSON 字段要求：\n"
-        "- main-state: 取值于 [patient-positive, patient-negative, doctor-positive, doctor-negative, unknown]\n"
-        "- past-medical-history: 取值于 [yes, no, unknown]\n"
-        "- other-relevant-information: 列表，填写与该概念相关的其他关键信息（如持续时间、部位等）\n\n"
-        f"对话内容:\n{context}\n\n"
-        f"目标概念（疾病/症状）:\n{target_entity}\n\n"
-        "只输出合法 JSON："
-    )
-
-
-def table6_reasoning(question: str) -> str:
-    # 中文：表6 用于 PP 的 LLM 中间推理提示（中文版本，限制 50 字）
-    return (
-        "你是一名资深医生。请针对以下医疗问题给出不超过50字的有效建议。\n\n"
-        f"问题:\n{question}\n\n"
-        "建议："
-    )
-
-
-def relation_type_classifier(context: str, graph_text: str) -> str:
-    # 中文：用于判定当前最需要的知识类型（映射到 Disease-KB 可用关系）
-    # 目标标签（英文，便于程序处理）：
-    # - treatment  → 用药/治疗（common_drug, recommand_drug）
-    # - check      → 检查（need_check）
-    # - diet       → 饮食（do_eat, no_eat, recommand_eat）
-    # - symptom2disease → 症状归因（accompany_with/has_symptom 联合，用于先找疾病再找药）
-    return (
-        "你是一名资深医生助理。根据对话与先有的患者中心图，判断当前回答最需要补充的知识类型到患者中心图中去才能回答对话中的问题？"
-        "只能从以下标签中选择一个并原样输出：\n"
-        "- treatment  → 用药/治疗（common_drug, recommand_drug）\n"
-        "- check      → 检查（need_check）\n"
-        "- diet       → 饮食（do_eat, no_eat, recommand_eat）\n"
-        "- symptom2disease → 症状归因（accompany_with/has_symptom 联合，用于先找疾病再找药）\n\n"
-        f"对话内容:\n{context}\n\n"
-        f"患者中心图:\n{graph_text}\n\n"
-        "请只输出标签本身，不要多余文字。"
-    )
-
-
-def schema_selector(dialogue_text: str) -> str:
-    # 中文：仅基于对话全文，按明确中文规则选择需要触发的 PP Schema，返回 JSON 数组（名称原样）
-    return (
-        "你是一名临床推理助理。仅基于以下“中文医疗对话”，选择本轮需要触发的 PP 验证 Schema。\n"
-        "只返回 JSON 数组（不得包含多余文字），数组元素必须从下列名称中选择：\n"
-        "- pregnancy_symptom_medication\n"
-        "- specific_population_symptom_medication\n"
-        "- symptom_comorbidity_medication\n"
-        "- past_medical_history_symptom_medication\n"
-        "- drug_recommendation_symptom_medication\n"
-        "- taking_drug_symptom_medication\n\n"
-        "判定与触发规则（务必执行；满足则加入；可多选）：\n"
-        "1) 若出现“孕/怀孕/妊娠/孕妇/哺乳/哺乳期” → 加入 pregnancy_symptom_medication\n"
-        "2) 若出现“婴/宝宝/新生儿/儿童/小孩/幼儿/≤12个月龄/老年/高龄/老人” → 加入 specific_population_symptom_medication\n"
-        "3) 若症状提及达到2种或以上（如“头痛+反酸”） → 加入 symptom_comorbidity_medication\n"
-        "4) 若出现“以前/曾经/既往/病史/既往史”等既往病史措辞，且同时有当前症状 → 加入 past_medical_history_symptom_medication\n"
-        "5) 若出现“过敏/禁用/不推荐/不可用/医生负向态度”等用药限制或倾向 → 加入 drug_recommendation_symptom_medication\n"
-        "6) 若出现“正在服用/已在用”等正在用药表述 → 加入 taking_drug_symptom_medication\n\n"
-        "兜底：若不确定，仍至少选择与“人口/过敏/既往史/多症状”最相关的1-2个；禁止返回空数组。\n\n"
-        f"对话全文：\n{dialogue_text}\n\n"
-        "请严格只输出 JSON 数组，如：[\"schema_name\", ...]"
-    )
-
-def table8_final(
-    context: str,
-    graph_text: str,
-    np_facts: List[str],
-    pp_items: List[str],
-    candidate_diseases: List[str] = None,
-    candidate_medications: List[str] = None,
+def final_reasoning(
+    dialogue_text: str,
+    patient_state: Dict,
+    candidate_drugs: List[str],
+    safety_validation: List[str],
 ) -> str:
-    # 中文：表8 最终提示（中文版本）；支持可选候选集（评测/约束时使用）
-    diseases = ", ".join(candidate_diseases or []) or ""
-    meds = ", ".join(candidate_medications or []) or ""
-    np_block = "\n".join(f"- {f}" for f in np_facts) if np_facts else "(无)"
-    pp_block = "\n".join(f"- {p}" for p in pp_items) if pp_items else "(无)"
+    """新版：步骤4 - 最终LLM推理提示（新流程）。
     
-    # 根据是否有候选药物，调整约束文本
-    if candidate_medications:
-        constraint_text = f"请逐步思考，仅从以下候选药物中选取：{meds}。"
-    else:
-        constraint_text = "请逐步思考，基于患者病情和知识证据推荐合适的药物。"
+    中文：将患者状态、候选药物和安全验证结果全部喂给LLM，进行最终综合推理。
+    """
+    import json
+    
+    # 格式化患者状态（只显示非空字段）
+    formatted_state = {}
+    if patient_state.get("problems", {}).get("diagnosed"):
+        formatted_state["诊断的疾病"] = patient_state["problems"]["diagnosed"]
+    if patient_state.get("problems", {}).get("symptoms"):
+        formatted_state["症状"] = patient_state["problems"]["symptoms"]
+    
+    constraints = patient_state.get("constraints", {})
+    if constraints.get("allergies"):
+        formatted_state["过敏药物"] = constraints["allergies"]
+    if constraints.get("status"):
+        status_map = {"pregnant": "孕妇", "infant": "婴儿/幼儿", "elderly": "老年"}
+        formatted_state["特殊人群"] = [status_map.get(s, s) for s in constraints["status"]]
+    if constraints.get("past_history"):
+        formatted_state["既往病史"] = constraints["past_history"]
+    if constraints.get("taking_drugs"):
+        formatted_state["正在服用的药物"] = constraints["taking_drugs"]
+    if constraints.get("not_recommended_drugs"):
+        formatted_state["不推荐药物"] = constraints["not_recommended_drugs"]
+    
+    state_text = json.dumps(formatted_state, ensure_ascii=False, indent=2)
+    candidates_text = ", ".join(candidate_drugs) if candidate_drugs else "(无)"
+    validation_text = "\n".join(f"- {v}" for v in safety_validation) if safety_validation else "- (无)"
     
     return (
-        "你是一名资深医生。给定一段中文医疗对话，请基于患者的疾病与症状推荐合适且安全的用药。\n"
-        f"可能的疾病范围（如有）：[{diseases}]；候选药物范围（如有）：[{meds}]。\n"
-        "患者中心图是对该对话的结构化摘要；邻域提示与路径提示可视为与当前患者相关的知识证据。\n"
-        f"{constraint_text}\n"
+        "你是一名专业的医疗助手。请根据以下信息，为患者生成一个推荐。\n\n"
+        "# 1. 患者状态（来自对话分析）：\n"
+        f"{state_text}\n\n"
+        "# 2. 候选药物（来自知识图谱查询）：\n"
+        f"{candidates_text}\n\n"
+        "# 3. 安全性/有效性审查（来自知识图谱验证）：\n"
+        f"{validation_text}\n\n"
+        "# 4. 你的任务：\n"
+        "请综合以上所有信息，给出一个专业的用药建议，并解释你为什么这么选（或排除了其他选项）。\n"
         "请仅输出一个 JSON 数组，数组元素的字段必须为：\n"
-        "- drug（药物名，字符串）；- dosage（剂量，可选）；- regimen（用法用量，可选）；- rationale（推荐理由，简述中文）；- cited_evidence_ids（证据ID列表，可为空）。\n\n"
-        f"对话内容:\n{context}\n\n"
-        f"患者中心图（三元组）:\n{graph_text}\n\n"
-        f"邻域提示（NP）:\n{np_block}\n\n"
-        f"路径提示（PP）:\n{pp_block}\n\n"
-        "请只输出 JSON，不要添加任何解释："
+        "- drug（药物名，字符串）\n"
+        "- dosage（剂量，可选）\n"
+        "- regimen（用法用量，可选）\n"
+        "- rationale（推荐理由，简述中文，必须解释为什么选择这个药物，以及如何考虑了安全验证结果）\n"
+        "- cited_evidence_ids（证据ID列表，从安全验证结果中提取，如 [\"E0001\", \"E0002\"]）\n\n"
+        f"对话原文（供参考）：\n{dialogue_text}\n\n"
+        "请只输出 JSON 数组，不要添加任何解释："
     )
-
 

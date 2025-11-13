@@ -1,12 +1,11 @@
-"""Final assembly (Table 8) and LLM inference.
+"""LLM inference utilities.
 
-中文说明：组装最终提示并调用 LLM。默认提供占位 LLM（可替换）。
+中文说明：提供LLM调用器，支持不同提供商的API调用。
 """
 
 import json
 from typing import List, Dict
 import requests
-from .prompts import table8_final
 from .config import llm as llm_cfg
 import time
 
@@ -157,56 +156,4 @@ def get_llm_caller(expect_json: bool = False):
         return _caller
 
     return _dummy_llm_call
-
-
-def run_final_inference(
-    context: str,
-    graph_text: str,
-    np_facts: List[str],
-    pp_items: List[str],
-    candidate_diseases: List[str] = None,
-    candidate_medications: List[str] = None,
-) -> Dict:
-    """Build final prompt and run the model; return dict with recs and raw text.
-
-    中文：构造最终提示，调用 LLM 并解析为药物推荐列表（JSON）。
-    """
-    prompt = table8_final(
-        context=context,
-        graph_text=graph_text,
-        np_facts=np_facts,
-        pp_items=pp_items,
-        candidate_diseases=candidate_diseases,
-        candidate_medications=candidate_medications,
-    )
-    caller = get_llm_caller(expect_json=True)
-    t0 = time.time()
-    raw = caller(prompt)
-    dt = int((time.time() - t0) * 1000)
-    try:
-        print(f"[LLM][final][{llm_cfg.provider}:{llm_cfg.model}] {dt} ms, in={len(prompt)} chars, out={len(str(raw))} chars")
-    except Exception:
-        pass
-    # 中文：容错解析——去掉 Markdown 代码块围栏，并尽力提取 JSON 数组
-    cleaned = raw.strip()
-    if cleaned.startswith("```"):
-        # 删除围栏 ```json ... ```
-        cleaned = cleaned.strip("`")
-        # 再次尝试提取 JSON 体
-    # 简单截取首个 '[' 到最后一个 ']' 之间的内容
-    if "[" in cleaned and "]" in cleaned:
-        try:
-            start = cleaned.index("[")
-            end = cleaned.rindex("]") + 1
-            cleaned = cleaned[start:end]
-        except Exception:
-            pass
-    try:
-        data = json.loads(cleaned)
-        if isinstance(data, list):
-            return {"recommendations": data, "llm_raw": raw, "final_prompt": prompt}
-    except Exception:
-        return {"recommendations": [], "llm_raw": raw, "final_prompt": prompt}
-    return {"recommendations": [], "llm_raw": raw, "final_prompt": prompt}
-
 

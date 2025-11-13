@@ -67,18 +67,37 @@ def _similarity(a: str, b: str) -> float:
     """计算两个字符串的相似度（0-1之间，1表示完全相同）"""
     return SequenceMatcher(None, a.lower(), b.lower()).ratio()
 
-def _find_by_edit_distance(sess: Session, query: str, threshold: float = 0.7) -> Optional[Dict]:
-    """使用编辑距离（相似度）匹配实体"""
-    # 先获取所有可能的候选节点（限制范围以避免性能问题）
-    cypher = """
-    MATCH (n)
-    WHERE toLower(n.name) CONTAINS $prefix OR toLower($query) CONTAINS toLower(n.name)
-    RETURN id(n) AS id, labels(n)[0] AS label, n.name AS name
-    LIMIT 100
+def _find_by_edit_distance(sess: Session, query: str, threshold: float = 0.7, allowed_labels: List[str] = None) -> Optional[Dict]:
+    """使用编辑距离（相似度）匹配实体
+    
+    Args:
+        sess: Neo4j session
+        query: 查询字符串
+        threshold: 相似度阈值
+        allowed_labels: 允许的节点标签列表（如 ["Disease", "Symptom"]），None 表示不限制
     """
+    # 先获取所有可能的候选节点（限制范围以避免性能问题）
     prefix = query[:2] if len(query) >= 2 else query  # 取前2个字符作为前缀过滤
     
-    recs = sess.run(cypher, query=query, prefix=prefix)
+    if allowed_labels:
+        allowed_labels_lower = [l.lower() for l in allowed_labels]
+        cypher = """
+        MATCH (n)
+        WHERE (toLower(n.name) CONTAINS $prefix OR toLower($query) CONTAINS toLower(n.name))
+          AND ANY(label IN labels(n) WHERE toLower(label) IN $allowed_labels)
+        RETURN id(n) AS id, labels(n)[0] AS label, n.name AS name
+        LIMIT 100
+        """
+        recs = sess.run(cypher, query=query, prefix=prefix, allowed_labels=allowed_labels_lower)
+    else:
+        cypher = """
+        MATCH (n)
+        WHERE toLower(n.name) CONTAINS $prefix OR toLower($query) CONTAINS toLower(n.name)
+        RETURN id(n) AS id, labels(n)[0] AS label, n.name AS name
+        LIMIT 100
+        """
+        recs = sess.run(cypher, query=query, prefix=prefix)
+    
     best_match = None
     best_score = 0.0
     
@@ -150,21 +169,97 @@ def query_diseasekb_drugs_for_diseases(sess: Session, disease_names: List[str], 
 
 
 def query_diseasekb_drugs_for_symptoms(sess: Session, symptom_names: List[str], k: int) -> List[str]:
-    """DiseaseKB: 症状→（伴随）→疾病→药物
+    """DiseaseKB: 症状→药物（改进版：同时查询1跳和2跳路径）
     
-    中文：查询DiseaseKB中症状通过伴随关系找到的疾病对应的药物。
+    中文：查询DiseaseKB中症状相关的药物。
+    - 1跳路径：症状直接治疗药物（Symptom → Drug）
+    - 2跳路径：症状→疾病→药物（Symptom → Disease → Drug）
+    
+    合并结果以提高召回率。
     """
     if not symptom_names:
         return []
-    cypher = """
-    MATCH (s:Symptom)-[:acompany_with]->(d:Disease)-[r]->(m:Drug)
-    WHERE toLower(s.name) IN $names AND type(r) IN ['common_drug','recommand_drug']
-    RETURN s.name AS s, d.name AS d, type(r) AS rel, m.name AS m
-    LIMIT $k
-    """
+    
     names = [n.strip().lower() for n in symptom_names]
-    recs = sess.run(cypher, names=names, k=k)
-    return [f"症状『{row['s']}』常伴疾病『{row['d']}』—{row['rel']}→药物『{row['m']}』" for row in recs]
+    all_results = []
+    seen = set()
+    
+    # 策略1：1跳路径（症状直接治疗药物）- 如果KG中存在这种关系
+    try:
+        cypher_1hop = """
+        MATCH (s:Symptom)-[r]->(m:Drug)
+        WHERE toLower(s.name) IN $names 
+          AND type(r) IN ['treatment', 'common_drug', 'recommand_drug']
+        RETURN s.name AS s, "N/A" AS d, type(r) AS rel, m.name AS m
+        LIMIT $k
+        """
+        recs_1hop = list(sess.run(cypher_1hop, names=names, k=k))
+        for row in recs_1hop:
+            key = (row['s'], row['m'])
+            if key not in seen:
+                seen.add(key)
+                all_results.append(row)
+    except Exception:
+        # 如果1跳路径不存在，跳过
+        pass
+    
+    # 策略2：2跳路径（症状→疾病→药物）
+    # 改进：优先查询同时包含所有症状的疾病，避免误匹配
+    if len(names) > 1:
+        # 多个症状：查询同时包含所有症状的疾病（准确匹配）
+        cypher_2hop_strict = """
+        MATCH (d:Disease)-[r]->(m:Drug)
+        WHERE type(r) IN ['common_drug','recommand_drug']
+          AND ALL(symptom IN $names WHERE EXISTS {
+            MATCH (s:Symptom)-[:acompany_with]->(d)
+            WHERE toLower(s.name) = symptom
+          })
+        RETURN d.name AS d, type(r) AS rel, m.name AS m
+        LIMIT $k
+        """
+        try:
+            recs_2hop_strict = list(sess.run(cypher_2hop_strict, names=names, k=k))
+            for row in recs_2hop_strict:
+                key = ("combined", row['m'])  # 使用"combined"表示多症状组合
+                if key not in seen and len(all_results) < k:
+                    seen.add(key)
+                    all_results.append({
+                        's': '+'.join(names),  # 组合症状
+                        'd': row['d'],
+                        'rel': row['rel'],
+                        'm': row['m']
+                    })
+        except Exception:
+            # 如果严格匹配失败，降级到宽松匹配
+            pass
+    
+    # 如果严格匹配没有结果，或者只有单个症状，使用宽松匹配（原有逻辑）
+    if len(all_results) < k:
+        cypher_2hop = """
+        MATCH (s:Symptom)-[:acompany_with]->(d:Disease)-[r]->(m:Drug)
+        WHERE toLower(s.name) IN $names 
+          AND type(r) IN ['common_drug','recommand_drug']
+        RETURN s.name AS s, d.name AS d, type(r) AS rel, m.name AS m
+        LIMIT $k
+        """
+        recs_2hop = list(sess.run(cypher_2hop, names=names, k=k))
+        for row in recs_2hop:
+            key = (row['s'], row['m'])
+            if key not in seen and len(all_results) < k:
+                seen.add(key)
+                all_results.append(row)
+    
+    # 格式化返回结果
+    results = []
+    for row in all_results[:k]:
+        if row['d'] == "N/A":
+            # 1跳路径：症状直接治疗
+            results.append(f"症状『{row['s']}』—{row['rel']}→药物『{row['m']}』")
+        else:
+            # 2跳路径：症状→疾病→药物
+            results.append(f"症状『{row['s']}』常伴疾病『{row['d']}』—{row['rel']}→药物『{row['m']}』")
+    
+    return results
 
 
 def query_diseasekb_checks_for_diseases(sess: Session, disease_names: List[str], k: int) -> List[str]:
@@ -263,27 +358,51 @@ def query_diseasekb_diet_for_diseases_struct(sess: Session, disease_names: List[
     return [(row['d'], row['rel'], row['f']) for row in recs]
 
 
-def query_diseasekb_resolve_entity(sess: Session, name: str, use_fulltext: bool = True, use_vector: bool = True) -> Dict:
+def query_diseasekb_resolve_entity(sess: Session, name: str, use_fulltext: bool = True, use_vector: bool = True, allowed_labels: List[str] = None) -> Dict:
     """DiseaseKB: 实体链接（精确/向量检索/编辑距离/全文索引匹配）
     
     改进版：先精确与向量检索，去掉同义词表。
     匹配策略：精确匹配 → 向量检索 → 编辑距离匹配 → 全文索引匹配 → 失败返回空
+    
+    Args:
+        name: 实体名称
+        use_fulltext: 是否使用全文索引
+        use_vector: 是否使用向量检索
+        allowed_labels: 允许的节点标签列表（如 ["Disease", "Symptom"]），None 表示不限制
     """
     q = (name or "").strip()
     if not q:
         return {}
     q_lower = q.lower()
     
+    # 标准化 allowed_labels（转为小写，便于比较）
+    allowed_labels_lower = None
+    if allowed_labels:
+        allowed_labels_lower = [l.lower() for l in allowed_labels]
+        print(f"[query][diseasekb] 只匹配以下标签: {allowed_labels}")
+    
     # 策略1：精确匹配（忽略大小写）- 最快，优先使用
-    cypher_exact = """
-    MATCH (n)
-    WHERE toLower(n.name) = $q
-    RETURN id(n) AS id, labels(n)[0] AS label, n.name AS name
-    LIMIT 1
-    """
-    rec = sess.run(cypher_exact, q=q_lower).single()
+    if allowed_labels:
+        # 如果指定了 allowed_labels，在 Cypher 中过滤
+        cypher_exact = """
+        MATCH (n)
+        WHERE toLower(n.name) = $q
+          AND ANY(label IN labels(n) WHERE toLower(label) IN $allowed_labels)
+        RETURN id(n) AS id, labels(n)[0] AS label, n.name AS name
+        LIMIT 1
+        """
+        rec = sess.run(cypher_exact, q=q_lower, allowed_labels=allowed_labels_lower).single()
+    else:
+        cypher_exact = """
+        MATCH (n)
+        WHERE toLower(n.name) = $q
+        RETURN id(n) AS id, labels(n)[0] AS label, n.name AS name
+        LIMIT 1
+        """
+        rec = sess.run(cypher_exact, q=q_lower).single()
+    
     if rec:
-        print(f"[query][diseasekb][exact] 精确匹配成功: '{q}' -> '{rec['name']}'")
+        print(f"[query][diseasekb][exact] 精确匹配成功: '{q}' -> '{rec['name']}' (label: {rec['label']})")
         return {"id": rec["id"], "label": rec["label"], "name": rec["name"]}
     else:
         print(f"[query][diseasekb][exact] 精确匹配失败: '{q}'")
@@ -298,35 +417,49 @@ def query_diseasekb_resolve_entity(sess: Session, name: str, use_fulltext: bool 
             if not candidates:
                 print(f"[query][diseasekb][vector] 未找到超过阈值({vector_search.threshold})的候选")
             if candidates:
-                # 调试日志：显示向量检索结果
-                print(f"[query][diseasekb][vector] 查询'{q}' -> 找到{len(candidates)}个候选，最佳: {candidates[0]['name']} (相似度: {candidates[0].get('score', candidates[0].get('similarity', 'N/A')):.4f})")
-                best = candidates[0]
-                # 再次过滤人群关键词
-                matched_name = best["name"]
-                population_keywords = ["孕", "婴", "新生儿", "儿童", "老年", "老人"]
-                query_has_pop = any(kw in q for kw in population_keywords)
-                match_has_pop = any(kw in matched_name for kw in population_keywords)
+                # 如果指定了 allowed_labels，过滤候选
+                if allowed_labels_lower:
+                    filtered_candidates = [
+                        c for c in candidates 
+                        if c.get("label", "").lower() in allowed_labels_lower
+                    ]
+                    if filtered_candidates:
+                        candidates = filtered_candidates
+                        print(f"[query][diseasekb][vector] 过滤后剩余 {len(candidates)} 个候选（只保留 {allowed_labels} 类型）")
+                    else:
+                        print(f"[query][diseasekb][vector] 所有候选都不在允许的标签中，跳过向量检索")
+                        candidates = []
                 
-                if not query_has_pop and match_has_pop:
-                    # 查询不涉及人群，但匹配结果涉及人群，尝试下一个候选
-                    if len(candidates) > 1:
-                        best = candidates[1]
-                        matched_name = best["name"]
-                        match_has_pop = any(kw in matched_name for kw in population_keywords)
-                        if not query_has_pop and match_has_pop:
-                            # 如果下一个候选也有问题，跳过向量检索，继续其他策略
-                            pass
-                        else:
-                            return {"id": best["id"], "label": best["label"], "name": best["name"]}
-                else:
-                    # 人群关键词匹配，或没有人群关键词问题，直接返回
-                    return {"id": best["id"], "label": best["label"], "name": best["name"]}
+                if candidates:
+                    # 调试日志：显示向量检索结果
+                    print(f"[query][diseasekb][vector] 查询'{q}' -> 找到{len(candidates)}个候选，最佳: {candidates[0]['name']} (相似度: {candidates[0].get('score', candidates[0].get('similarity', 'N/A')):.4f}, label: {candidates[0].get('label', 'N/A')})")
+                    best = candidates[0]
+                    # 再次过滤人群关键词
+                    matched_name = best["name"]
+                    population_keywords = ["孕", "婴", "新生儿", "儿童", "老年", "老人"]
+                    query_has_pop = any(kw in q for kw in population_keywords)
+                    match_has_pop = any(kw in matched_name for kw in population_keywords)
+                    
+                    if not query_has_pop and match_has_pop:
+                        # 查询不涉及人群，但匹配结果涉及人群，尝试下一个候选
+                        if len(candidates) > 1:
+                            best = candidates[1]
+                            matched_name = best["name"]
+                            match_has_pop = any(kw in matched_name for kw in population_keywords)
+                            if not query_has_pop and match_has_pop:
+                                # 如果下一个候选也有问题，跳过向量检索，继续其他策略
+                                pass
+                            else:
+                                return {"id": best["id"], "label": best["label"], "name": best["name"]}
+                    else:
+                        # 人群关键词匹配，或没有人群关键词问题，直接返回
+                        return {"id": best["id"], "label": best["label"], "name": best["name"]}
     
     # 策略3：编辑距离匹配（相似度阈值 >= 0.7）
     # 同时过滤掉包含人群关键词的节点（除非查询本身包含这些词）
-    match = _find_by_edit_distance(sess, q, threshold=0.7)
+    match = _find_by_edit_distance(sess, q, threshold=0.7, allowed_labels=allowed_labels)
     if match:
-        print(f"[query][cmekg][edit_distance] 编辑距离匹配成功: '{q}' -> '{match['name']}' (相似度: {match.get('similarity', 'N/A')})")
+        print(f"[query][cmekg][edit_distance] 编辑距离匹配成功: '{q}' -> '{match['name']}' (相似度: {match.get('score', 'N/A')}, label: {match.get('label', 'N/A')})")
         matched_name = match["name"]
         # 过滤人群关键词：如果查询不包含"孕/婴/新生儿/儿童/老年"，则拒绝包含这些词的匹配
         population_keywords = ["孕", "婴", "新生儿", "儿童", "老年", "老人"]
@@ -342,54 +475,45 @@ def query_diseasekb_resolve_entity(sess: Session, name: str, use_fulltext: bool 
     # 策略4：全文索引匹配（作为最后备选，仅在启用时使用）
     if use_fulltext:
         try:
-            # 尝试使用全文索引（需要在Disease/Symptom/Drug节点上已创建索引）
-            # 先尝试Disease节点
-            cypher_fulltext = """
-            CALL db.index.fulltext.queryNodes('disease_fulltext', $query)
-            YIELD node, score
-            WHERE score > 0.5
-            RETURN id(node) AS id, labels(node)[0] AS label, node.name AS name, score
-            ORDER BY score DESC
-            LIMIT 1
-            """
-            rec = sess.run(cypher_fulltext, query=q).single()
-            if rec:
-                # 再次过滤人群关键词
-                matched_name = rec["name"]
-                population_keywords = ["孕", "婴", "新生儿", "儿童", "老年", "老人"]
-                query_has_pop = any(kw in q for kw in population_keywords)
-                match_has_pop = any(kw in matched_name for kw in population_keywords)
-                
-                if not query_has_pop and match_has_pop:
-                    return {}
-                
-                return {"id": rec["id"], "label": rec["label"], "name": rec["name"]}
+            # 根据 allowed_labels 决定查询哪些索引
+            indices_to_try = []
+            if not allowed_labels_lower:
+                # 没有限制，尝试所有索引
+                indices_to_try = [
+                    ("disease_fulltext", "Disease"),
+                    ("symptom_fulltext", "Symptom"),
+                    ("drug_fulltext", "Drug")
+                ]
+            else:
+                # 只查询允许的标签对应的索引
+                if "disease" in allowed_labels_lower:
+                    indices_to_try.append(("disease_fulltext", "Disease"))
+                if "symptom" in allowed_labels_lower:
+                    indices_to_try.append(("symptom_fulltext", "Symptom"))
+                if "drug" in allowed_labels_lower:
+                    indices_to_try.append(("drug_fulltext", "Drug"))
             
-            # 尝试Symptom节点
-            cypher_fulltext = """
-            CALL db.index.fulltext.queryNodes('symptom_fulltext', $query)
-            YIELD node, score
-            WHERE score > 0.5
-            RETURN id(node) AS id, labels(node)[0] AS label, node.name AS name, score
-            ORDER BY score DESC
-            LIMIT 1
-            """
-            rec = sess.run(cypher_fulltext, query=q).single()
-            if rec:
-                return {"id": rec["id"], "label": rec["label"], "name": rec["name"]}
-            
-            # 尝试Drug节点
-            cypher_fulltext = """
-            CALL db.index.fulltext.queryNodes('drug_fulltext', $query)
-            YIELD node, score
-            WHERE score > 0.5
-            RETURN id(node) AS id, labels(node)[0] AS label, node.name AS name, score
-            ORDER BY score DESC
-            LIMIT 1
-            """
-            rec = sess.run(cypher_fulltext, query=q).single()
-            if rec:
-                return {"id": rec["id"], "label": rec["label"], "name": rec["name"]}
+            for index_name, label_type in indices_to_try:
+                cypher_fulltext = f"""
+                CALL db.index.fulltext.queryNodes('{index_name}', $query)
+                YIELD node, score
+                WHERE score > 0.5
+                RETURN id(node) AS id, labels(node)[0] AS label, node.name AS name, score
+                ORDER BY score DESC
+                LIMIT 1
+                """
+                rec = sess.run(cypher_fulltext, query=q).single()
+                if rec:
+                    # 再次过滤人群关键词
+                    matched_name = rec["name"]
+                    population_keywords = ["孕", "婴", "新生儿", "儿童", "老年", "老人"]
+                    query_has_pop = any(kw in q for kw in population_keywords)
+                    match_has_pop = any(kw in matched_name for kw in population_keywords)
+                    
+                    if not query_has_pop and match_has_pop:
+                        continue  # 跳过这个匹配，尝试下一个索引
+                    
+                    return {"id": rec["id"], "label": rec["label"], "name": rec["name"]}
         except Exception:
             # 全文索引可能不存在，忽略错误
             pass
@@ -453,23 +577,99 @@ def query_cmekg_drugs_for_diseases(sess: Session, disease_names: List[str], k: i
 
 
 def query_cmekg_drugs_for_symptoms(sess: Session, symptom_names: List[str], k: int) -> List[str]:
-    """CMeKG: 症状→（相关）→疾病→药物
+    """CMeKG: 症状→药物（改进版：同时查询1跳和2跳路径）
     
-    中文：查询CMeKG中症状通过relatedDisease或relatedSymptom找到的疾病对应的药物。
+    中文：查询CMeKG中症状相关的药物。
+    - 1跳路径：症状直接治疗药物（Symptom → Drug）
+    - 2跳路径：症状→疾病→药物（Symptom → Disease → Drug）
+    
+    合并结果以提高召回率。
     """
     if not symptom_names:
         return []
-    cypher = """
-    MATCH (s:Symptom)-[r1]->(d:Disease)-[r2]->(m:Drug)
-    WHERE toLower(s.name) IN $names 
-      AND type(r1) IN ['relatedDisease', 'relatedSymptom', 'relatedTo']
-      AND type(r2) IN ['drugTherapy', 'treatment', 'Treatment', 'drugTherapy']
-    RETURN s.name AS s, d.name AS d, type(r2) AS rel, m.name AS m
-    LIMIT $k
-    """
+    
     names = [n.strip().lower() for n in symptom_names]
-    recs = sess.run(cypher, names=names, k=k)
-    return [f"症状『{row['s']}』相关疾病『{row['d']}』—{row['rel']}→药物『{row['m']}』" for row in recs]
+    all_results = []
+    seen = set()
+    
+    # 策略1：1跳路径（症状直接治疗药物）- 如果KG中存在这种关系
+    try:
+        cypher_1hop = """
+        MATCH (s:Symptom)-[r]->(m:Drug)
+        WHERE toLower(s.name) IN $names 
+          AND type(r) IN ['drugTherapy', 'treatment', 'Treatment']
+        RETURN s.name AS s, "N/A" AS d, type(r) AS rel, m.name AS m
+        LIMIT $k
+        """
+        recs_1hop = list(sess.run(cypher_1hop, names=names, k=k))
+        for row in recs_1hop:
+            key = (row['s'], row['m'])
+            if key not in seen:
+                seen.add(key)
+                all_results.append(row)
+    except Exception:
+        # 如果1跳路径不存在，跳过
+        pass
+    
+    # 策略2：2跳路径（症状→疾病→药物）
+    # 改进：优先查询同时包含所有症状的疾病，避免误匹配
+    if len(names) > 1:
+        # 多个症状：查询同时包含所有症状的疾病（准确匹配）
+        cypher_2hop_strict = """
+        MATCH (d:Disease)-[r2]->(m:Drug)
+        WHERE type(r2) IN ['drugTherapy', 'treatment', 'Treatment']
+          AND ALL(symptom IN $names WHERE EXISTS {
+            MATCH (s:Symptom)-[r1]->(d)
+            WHERE toLower(s.name) = symptom
+              AND type(r1) IN ['relatedDisease', 'relatedSymptom', 'relatedTo']
+          })
+        RETURN d.name AS d, type(r2) AS rel, m.name AS m
+        LIMIT $k
+        """
+        try:
+            recs_2hop_strict = list(sess.run(cypher_2hop_strict, names=names, k=k))
+            for row in recs_2hop_strict:
+                key = ("combined", row['m'])  # 使用"combined"表示多症状组合
+                if key not in seen and len(all_results) < k:
+                    seen.add(key)
+                    all_results.append({
+                        's': '+'.join(names),  # 组合症状
+                        'd': row['d'],
+                        'rel': row['rel'],
+                        'm': row['m']
+                    })
+        except Exception:
+            # 如果严格匹配失败，降级到宽松匹配
+            pass
+    
+    # 如果严格匹配没有结果，或者只有单个症状，使用宽松匹配（原有逻辑）
+    if len(all_results) < k:
+        cypher_2hop = """
+        MATCH (s:Symptom)-[r1]->(d:Disease)-[r2]->(m:Drug)
+        WHERE toLower(s.name) IN $names 
+          AND type(r1) IN ['relatedDisease', 'relatedSymptom', 'relatedTo']
+          AND type(r2) IN ['drugTherapy', 'treatment', 'Treatment']
+        RETURN s.name AS s, d.name AS d, type(r2) AS rel, m.name AS m
+        LIMIT $k
+        """
+        recs_2hop = list(sess.run(cypher_2hop, names=names, k=k))
+        for row in recs_2hop:
+            key = (row['s'], row['m'])
+            if key not in seen and len(all_results) < k:
+                seen.add(key)
+                all_results.append(row)
+    
+    # 格式化返回结果
+    results = []
+    for row in all_results[:k]:
+        if row['d'] == "N/A":
+            # 1跳路径：症状直接治疗
+            results.append(f"症状『{row['s']}』—{row['rel']}→药物『{row['m']}』")
+        else:
+            # 2跳路径：症状→疾病→药物
+            results.append(f"症状『{row['s']}』相关疾病『{row['d']}』—{row['rel']}→药物『{row['m']}』")
+    
+    return results
 
 
 def query_cmekg_checks_for_diseases(sess: Session, disease_names: List[str], k: int) -> List[str]:
@@ -585,27 +785,51 @@ def query_cmekg_diet_for_diseases_struct(sess: Session, disease_names: List[str]
         return []
 
 
-def query_cmekg_resolve_entity(sess: Session, name: str, use_fulltext: bool = True, use_vector: bool = True) -> Dict:
+def query_cmekg_resolve_entity(sess: Session, name: str, use_fulltext: bool = True, use_vector: bool = True, allowed_labels: List[str] = None) -> Dict:
     """CMeKG: 实体链接（精确/向量检索/编辑距离/全文索引匹配）
     
     改进版：先精确与向量检索，去掉同义词表。
     匹配策略：精确匹配 → 向量检索 → 编辑距离匹配 → 全文索引匹配 → 失败返回空
+    
+    Args:
+        name: 实体名称
+        use_fulltext: 是否使用全文索引
+        use_vector: 是否使用向量检索
+        allowed_labels: 允许的节点标签列表（如 ["Disease", "Symptom"]），None 表示不限制
     """
     q = (name or "").strip()
     if not q:
         return {}
     q_lower = q.lower()
     
+    # 标准化 allowed_labels（转为小写，便于比较）
+    allowed_labels_lower = None
+    if allowed_labels:
+        allowed_labels_lower = [l.lower() for l in allowed_labels]
+        print(f"[query][cmekg] 只匹配以下标签: {allowed_labels}")
+    
     # 策略1：精确匹配（忽略大小写）- 最快，优先使用
-    cypher_exact = """
-    MATCH (n)
-    WHERE toLower(n.name) = $q
-    RETURN id(n) AS id, labels(n)[0] AS label, n.name AS name
-    LIMIT 1
-    """
-    rec = sess.run(cypher_exact, q=q_lower).single()
+    if allowed_labels:
+        # 如果指定了 allowed_labels，在 Cypher 中过滤
+        cypher_exact = """
+        MATCH (n)
+        WHERE toLower(n.name) = $q
+          AND ANY(label IN labels(n) WHERE toLower(label) IN $allowed_labels)
+        RETURN id(n) AS id, labels(n)[0] AS label, n.name AS name
+        LIMIT 1
+        """
+        rec = sess.run(cypher_exact, q=q_lower, allowed_labels=allowed_labels_lower).single()
+    else:
+        cypher_exact = """
+        MATCH (n)
+        WHERE toLower(n.name) = $q
+        RETURN id(n) AS id, labels(n)[0] AS label, n.name AS name
+        LIMIT 1
+        """
+        rec = sess.run(cypher_exact, q=q_lower).single()
+    
     if rec:
-        print(f"[query][cmekg][exact] 精确匹配成功: '{q}' -> '{rec['name']}'")
+        print(f"[query][cmekg][exact] 精确匹配成功: '{q}' -> '{rec['name']}' (label: {rec['label']})")
         return {"id": rec["id"], "label": rec["label"], "name": rec["name"]}
     else:
         print(f"[query][cmekg][exact] 精确匹配失败: '{q}'")
@@ -620,35 +844,49 @@ def query_cmekg_resolve_entity(sess: Session, name: str, use_fulltext: bool = Tr
             if not candidates:
                 print(f"[query][cmekg][vector] 未找到超过阈值({vector_search.threshold})的候选")
             if candidates:
-                # 调试日志：显示向量检索结果
-                print(f"[query][cmekg][vector] 查询'{q}' -> 找到{len(candidates)}个候选，最佳: {candidates[0]['name']} (相似度: {candidates[0].get('score', candidates[0].get('similarity', 'N/A')):.4f})")
-                best = candidates[0]
-                # 再次过滤人群关键词
-                matched_name = best["name"]
-                population_keywords = ["孕", "婴", "新生儿", "儿童", "老年", "老人"]
-                query_has_pop = any(kw in q for kw in population_keywords)
-                match_has_pop = any(kw in matched_name for kw in population_keywords)
+                # 如果指定了 allowed_labels，过滤候选
+                if allowed_labels_lower:
+                    filtered_candidates = [
+                        c for c in candidates 
+                        if c.get("label", "").lower() in allowed_labels_lower
+                    ]
+                    if filtered_candidates:
+                        candidates = filtered_candidates
+                        print(f"[query][cmekg][vector] 过滤后剩余 {len(candidates)} 个候选（只保留 {allowed_labels} 类型）")
+                    else:
+                        print(f"[query][cmekg][vector] 所有候选都不在允许的标签中，跳过向量检索")
+                        candidates = []
                 
-                if not query_has_pop and match_has_pop:
-                    # 查询不涉及人群，但匹配结果涉及人群，尝试下一个候选
-                    if len(candidates) > 1:
-                        best = candidates[1]
-                        matched_name = best["name"]
-                        match_has_pop = any(kw in matched_name for kw in population_keywords)
-                        if not query_has_pop and match_has_pop:
-                            # 如果下一个候选也有问题，跳过向量检索，继续其他策略
-                            pass
-                        else:
-                            return {"id": best["id"], "label": best["label"], "name": best["name"]}
-                else:
-                    # 人群关键词匹配，或没有人群关键词问题，直接返回
-                    return {"id": best["id"], "label": best["label"], "name": best["name"]}
+                if candidates:
+                    # 调试日志：显示向量检索结果
+                    print(f"[query][cmekg][vector] 查询'{q}' -> 找到{len(candidates)}个候选，最佳: {candidates[0]['name']} (相似度: {candidates[0].get('score', candidates[0].get('similarity', 'N/A')):.4f}, label: {candidates[0].get('label', 'N/A')})")
+                    best = candidates[0]
+                    # 再次过滤人群关键词
+                    matched_name = best["name"]
+                    population_keywords = ["孕", "婴", "新生儿", "儿童", "老年", "老人"]
+                    query_has_pop = any(kw in q for kw in population_keywords)
+                    match_has_pop = any(kw in matched_name for kw in population_keywords)
+                    
+                    if not query_has_pop and match_has_pop:
+                        # 查询不涉及人群，但匹配结果涉及人群，尝试下一个候选
+                        if len(candidates) > 1:
+                            best = candidates[1]
+                            matched_name = best["name"]
+                            match_has_pop = any(kw in matched_name for kw in population_keywords)
+                            if not query_has_pop and match_has_pop:
+                                # 如果下一个候选也有问题，跳过向量检索，继续其他策略
+                                pass
+                            else:
+                                return {"id": best["id"], "label": best["label"], "name": best["name"]}
+                    else:
+                        # 人群关键词匹配，或没有人群关键词问题，直接返回
+                        return {"id": best["id"], "label": best["label"], "name": best["name"]}
     
     # 策略3：编辑距离匹配（相似度阈值 >= 0.7）
     # 同时过滤掉包含人群关键词的节点（除非查询本身包含这些词）
-    match = _find_by_edit_distance(sess, q, threshold=0.7)
+    match = _find_by_edit_distance(sess, q, threshold=0.7, allowed_labels=allowed_labels)
     if match:
-        print(f"[query][cmekg][edit_distance] 编辑距离匹配成功: '{q}' -> '{match['name']}' (相似度: {match.get('similarity', 'N/A')})")
+        print(f"[query][cmekg][edit_distance] 编辑距离匹配成功: '{q}' -> '{match['name']}' (相似度: {match.get('score', 'N/A')}, label: {match.get('label', 'N/A')})")
         matched_name = match["name"]
         # 过滤人群关键词：如果查询不包含"孕/婴/新生儿/儿童/老年"，则拒绝包含这些词的匹配
         population_keywords = ["孕", "婴", "新生儿", "儿童", "老年", "老人"]
@@ -664,54 +902,45 @@ def query_cmekg_resolve_entity(sess: Session, name: str, use_fulltext: bool = Tr
     # 策略4：全文索引匹配（作为最后备选，仅在启用时使用）
     if use_fulltext:
         try:
-            # 尝试使用全文索引（需要在Disease/Symptom/Drug节点上已创建索引）
-            # 先尝试Disease节点
-            cypher_fulltext = """
-            CALL db.index.fulltext.queryNodes('disease_fulltext', $query)
-            YIELD node, score
-            WHERE score > 0.5
-            RETURN id(node) AS id, labels(node)[0] AS label, node.name AS name, score
-            ORDER BY score DESC
-            LIMIT 1
-            """
-            rec = sess.run(cypher_fulltext, query=q).single()
-            if rec:
-                # 再次过滤人群关键词
-                matched_name = rec["name"]
-                population_keywords = ["孕", "婴", "新生儿", "儿童", "老年", "老人"]
-                query_has_pop = any(kw in q for kw in population_keywords)
-                match_has_pop = any(kw in matched_name for kw in population_keywords)
-                
-                if not query_has_pop and match_has_pop:
-                    return {}
-                
-                return {"id": rec["id"], "label": rec["label"], "name": rec["name"]}
+            # 根据 allowed_labels 决定查询哪些索引
+            indices_to_try = []
+            if not allowed_labels_lower:
+                # 没有限制，尝试所有索引
+                indices_to_try = [
+                    ("disease_fulltext", "Disease"),
+                    ("symptom_fulltext", "Symptom"),
+                    ("drug_fulltext", "Drug")
+                ]
+            else:
+                # 只查询允许的标签对应的索引
+                if "disease" in allowed_labels_lower:
+                    indices_to_try.append(("disease_fulltext", "Disease"))
+                if "symptom" in allowed_labels_lower:
+                    indices_to_try.append(("symptom_fulltext", "Symptom"))
+                if "drug" in allowed_labels_lower:
+                    indices_to_try.append(("drug_fulltext", "Drug"))
             
-            # 尝试Symptom节点
-            cypher_fulltext = """
-            CALL db.index.fulltext.queryNodes('symptom_fulltext', $query)
-            YIELD node, score
-            WHERE score > 0.5
-            RETURN id(node) AS id, labels(node)[0] AS label, node.name AS name, score
-            ORDER BY score DESC
-            LIMIT 1
-            """
-            rec = sess.run(cypher_fulltext, query=q).single()
-            if rec:
-                return {"id": rec["id"], "label": rec["label"], "name": rec["name"]}
-            
-            # 尝试Drug节点
-            cypher_fulltext = """
-            CALL db.index.fulltext.queryNodes('drug_fulltext', $query)
-            YIELD node, score
-            WHERE score > 0.5
-            RETURN id(node) AS id, labels(node)[0] AS label, node.name AS name, score
-            ORDER BY score DESC
-            LIMIT 1
-            """
-            rec = sess.run(cypher_fulltext, query=q).single()
-            if rec:
-                return {"id": rec["id"], "label": rec["label"], "name": rec["name"]}
+            for index_name, label_type in indices_to_try:
+                cypher_fulltext = f"""
+                CALL db.index.fulltext.queryNodes('{index_name}', $query)
+                YIELD node, score
+                WHERE score > 0.5
+                RETURN id(node) AS id, labels(node)[0] AS label, node.name AS name, score
+                ORDER BY score DESC
+                LIMIT 1
+                """
+                rec = sess.run(cypher_fulltext, query=q).single()
+                if rec:
+                    # 再次过滤人群关键词
+                    matched_name = rec["name"]
+                    population_keywords = ["孕", "婴", "新生儿", "儿童", "老年", "老人"]
+                    query_has_pop = any(kw in q for kw in population_keywords)
+                    match_has_pop = any(kw in matched_name for kw in population_keywords)
+                    
+                    if not query_has_pop and match_has_pop:
+                        continue  # 跳过这个匹配，尝试下一个索引
+                    
+                    return {"id": rec["id"], "label": rec["label"], "name": rec["name"]}
         except Exception:
             # 全文索引可能不存在，忽略错误
             pass

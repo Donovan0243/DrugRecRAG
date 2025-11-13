@@ -150,6 +150,41 @@ class FAISSIndex:
         
         return instance
     
+    def get_vectors_by_names(self, entity_names: List[str]) -> List[Optional[np.ndarray]]:
+        """根据实体名称列表获取对应的向量。
+        
+        Args:
+            entity_names: 实体名称列表
+        
+        Returns:
+            向量列表，如果某个名称未找到则返回 None
+        """
+        if self.index.ntotal == 0:
+            return [None] * len(entity_names)
+        
+        # 构建 name -> index 的映射（只构建一次，可以缓存）
+        if not hasattr(self, '_name_to_index'):
+            self._name_to_index = {}
+            for idx, entity in enumerate(self.mapping):
+                name = entity.get("name", "").strip()
+                if name:
+                    # 如果有重名，保留第一个
+                    if name not in self._name_to_index:
+                        self._name_to_index[name] = idx
+        
+        results = []
+        for name in entity_names:
+            name = name.strip()
+            if name in self._name_to_index:
+                idx = self._name_to_index[name]
+                # 从 FAISS 索引中获取向量
+                vector = self.index.reconstruct(idx)
+                results.append(vector.astype(np.float32))
+            else:
+                results.append(None)
+        
+        return results
+    
     @property
     def size(self) -> int:
         """返回索引中的向量数量。"""

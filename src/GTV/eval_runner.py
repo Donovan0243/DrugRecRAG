@@ -1,14 +1,14 @@
-"""Evaluation runner for DialMed JSONL format.
+"""GTV Evaluation runner for DialMed JSONL format.
 
-中文说明：读取每行 JSON（含 dialog 数组与 label 列表），运行 GAP，计算平均指标。
+中文说明：GTV 流程的评估运行器，生成与原有流程相同格式的日志。
 """
 
 import json
 from typing import Iterable, Tuple, List, Dict, Set, Optional
 import os
 
-from .pipeline import run_gap
-from .eval import jaccard, f1
+from .pipeline import run_gtv
+from ..eval import jaccard, f1
 
 
 def _read_jsonl(path: str) -> Iterable[Dict]:
@@ -48,17 +48,19 @@ def _gold_set_from_labels(labels: List[str]) -> Set[str]:
     return {_normalize_med(x) for x in (labels or []) if _normalize_med(x)}
 
 
-def run_eval_dialmed(
+def run_eval_dialmed_gtv(
     path: str,
     limit: Optional[int] = None,
     out_path: Optional[str] = None,
     show_progress: bool = False,
     progress_every: int = 1,
     include_trace: bool = False,
+    debug_mode: bool = False,
+    use_candidate_list: bool = False,
 ) -> Dict[str, float]:
-    """Run evaluation over DialMed test file (JSONL lines).
+    """Run GTV evaluation over DialMed test file (JSONL lines).
 
-    中文：对每条样本：拼接对话→run_gap→提取预测集合→与 gold 计算 Jaccard/F1；返回宏平均。
+    中文：对每条样本：拼接对话→run_gtv→提取预测集合→与 gold 计算 Jaccard/F1；返回宏平均。
     """
     n = 0
     j_sum = 0.0
@@ -74,7 +76,7 @@ def run_eval_dialmed(
         labels = sample.get("label", [])
         dialogue = _dialogue_from_array(dlg_arr)
 
-        result = run_gap(dialogue)
+        result = run_gtv(dialogue, debug_mode=debug_mode, use_candidate_list=use_candidate_list)
         pred = _pred_set_from_recs(result.get("recommendations", []))
         gold = _gold_set_from_labels(labels)
 
@@ -84,7 +86,8 @@ def run_eval_dialmed(
         j_sum += j
         f1_sum += f
         n += 1
-        # 逐条输出
+        
+        # 逐条输出（格式与原有流程保持一致，同时包含 GTV 特有的字段）
         if out_f:
             record = {
                 "index": idx,
@@ -92,8 +95,12 @@ def run_eval_dialmed(
                 "gold": sorted(list(gold)),
                 "pred": sorted(list(pred)),
                 "patient_state": result.get("patient_state", {}),
-                "candidate_drugs": result.get("candidate_drugs", []),
+                # GTV 特有字段
+                "sft_recommendation": result.get("sft_recommendation", {}),
+                "validity_verification": result.get("validity_verification", []),
                 "safety_validation": result.get("safety_validation", []),
+                # 兼容原有字段（从 GTV 结果中提取）
+                "candidate_drugs": result.get("sft_recommendation", {}).get("drugs", []),
                 "llm_raw": result.get("llm_raw", ""),
                 "final_prompt": result.get("final_prompt", ""),
             }
@@ -118,5 +125,4 @@ def run_eval_dialmed(
         out_f.close()
 
     return metrics
-
 

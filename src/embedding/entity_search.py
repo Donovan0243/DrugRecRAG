@@ -110,6 +110,17 @@ class VectorEntitySearch:
         
         return all_results
     
+    def get_vectors_by_names(self, entity_names: List[str]) -> List[Optional[np.ndarray]]:
+        """根据实体名称列表获取对应的离线向量。
+        
+        Args:
+            entity_names: 实体名称列表（例如从 Neo4j 获取的安全文本名称）
+        
+        Returns:
+            向量列表，如果某个名称未找到则返回 None
+        """
+        return self.index.get_vectors_by_names(entity_names)
+    
     @property
     def size(self) -> int:
         """返回索引中的实体数量。"""
